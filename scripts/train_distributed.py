@@ -111,7 +111,7 @@ def train(args: argparse.Namespace) -> None:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             
             with torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
-                out = model(x, labels=y)
+                out = model(x, labels=y, gradient_checkpointing=args.gradient_checkpointing)
                 loss = out["loss"] / args.grad_accum
             
             scaler.scale(loss).backward()
@@ -155,6 +155,7 @@ def main():
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--tf32", action="store_true", default=True)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=500)

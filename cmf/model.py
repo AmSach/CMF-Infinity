@@ -91,9 +91,12 @@ class DilatedContextEncoder(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x)
+            if gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return x
 
 
@@ -183,7 +186,7 @@ class ContinuousMeaningField(nn.Module):
         batch_size, seq_len = input_ids.shape
         target_length = target_length or seq_len
         embeddings = self.embedding(input_ids)
-        context = self.encoder(embeddings)
+        context = self.encoder(embeddings, gradient_checkpointing=gradient_checkpointing)
 
         z = self.initial_state(context[:, 0])
         states = []
@@ -286,7 +289,7 @@ class ParallelContinuousMeaningField(nn.Module):
             raise ValueError("ParallelContinuousMeaningField cannot extrapolate target_length")
 
         embeddings = self.embedding(input_ids)
-        context = self.encoder(embeddings)[:, :target_length]
+        context = self.encoder(embeddings, gradient_checkpointing=gradient_checkpointing)[:, :target_length]
         z = self.initial_state(context)
         steps = self.config.solver_steps_per_token
         dt = 1.0 / float(steps)
