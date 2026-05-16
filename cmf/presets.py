@@ -146,6 +146,23 @@ PRESETS: dict[str, CMFInfinityPreset] = {
         ),
         description="120M-class deliberative CMF with iterative latent refinement and learned halting.",
     ),
+    "infinity-0.5b": CMFInfinityPreset(
+        name="infinity-0.5b",
+        model_type="parallel_cmf",
+        config=CMFConfig(
+            vocab_size=50257,
+            d_model=1024,
+            hidden_dim=4096,
+            num_layers=16,
+            kernel_size=3,
+            solver_steps_per_token=1,
+            max_seq_len=512,
+            dropout=0.0,
+            tie_embeddings=True,
+            adaptive_steps=False,
+        ),
+        description="0.5B-class CMF Infinity preset for high-throughput multi-GPU training.",
+    ),
     "infinity-8b": CMFInfinityPreset(
         name="infinity-8b",
         model_type="parallel_cmf",
