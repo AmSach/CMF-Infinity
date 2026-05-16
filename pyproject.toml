@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "continuous-meaning-field"
+version = "0.1.0"
+description = "Research prototype for language modeling as continuous latent semantic flow."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1",
+  "pytest>=8.0",
+]
+
+[project.optional-dependencies]
+scale = [
+  "datasets>=2.19",
+  "transformers>=4.41",
+  "tokenizers>=0.19",
+  "safetensors>=0.4",
+  "ninja>=1.11",
+]
+vision = [
+  "numpy>=1.26",
+  "pillow>=10",
+]
+power = [
+  "nvidia-ml-py>=13.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cmf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--disable-warnings"
+filterwarnings = [
+  "ignore::DeprecationWarning:_pytest.*",
+]
