@@ -170,27 +170,28 @@ def train(args: argparse.Namespace) -> None:
             print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights! ---")
         payload = torch.load(latest_ckpt, map_location="cpu")
             
-            if is_fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict = payload["model"] if is_master else None
-                    state_dict_list = [state_dict]
-                    dist.broadcast_object_list(state_dict_list, src=0)
-                    model.load_state_dict(state_dict_list[0])
-            else:
-                model.load_state_dict(payload["model"])
-                
-            start_step = payload["training"]["step"]
-            tokens_seen = payload["training"].get("tokens", 0)
+        if is_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = payload["model"] if is_master else None
+                state_dict_list = [state_dict]
+                dist.broadcast_object_list(state_dict_list, src=0)
+                model.load_state_dict(state_dict_list[0])
+        else:
+            model.load_state_dict(payload["model"])
             
-            # Step the scheduler to match the restored step count
-            for _ in range(start_step):
-                scheduler.step()
-                
-            if is_master:
-                print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+        start_step = payload["training"]["step"]
+        tokens_seen = payload["training"].get("tokens", 0)
+        
+        # Step the scheduler to match the restored step count
+        for _ in range(start_step):
+            scheduler.step()
+            
+        if is_master:
+            print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+
 
     # Load data
     # We use rank-specific seeds to ensure different ranks see different data shards/samples
