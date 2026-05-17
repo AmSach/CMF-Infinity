@@ -101,17 +101,33 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision
             
+            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+            import functools
+            
             # Keep master weights in FP32 on CPU during sharding to preserve high-precision initialization
             mp_policy = MixedPrecision(
                 param_dtype=torch.float32,
                 reduce_dtype=torch.float16,
                 buffer_dtype=torch.float32
             )
+            
+            # Wrap any submodules with >= 1M parameters to enable layer-by-layer sharding
+            my_auto_wrap_policy = functools.partial(
+                size_based_auto_wrap_policy,
+                min_num_params=1_000_000
+            )
+            
             # Wrap on CPU first. FSDP will automatically shard and move parameters to local_rank GPU
-            model = FSDP(model, device_id=local_rank, mixed_precision=mp_policy)
+            model = FSDP(
+                model,
+                device_id=local_rank,
+                mixed_precision=mp_policy,
+                auto_wrap_policy=my_auto_wrap_policy
+            )
             is_fsdp = True
             if is_master:
-                print("Using Fully Sharded Data Parallel (FSDP) with FP32 Master Weights and FP16 Gradient Reductions.")
+                print("Using Fully Sharded Data Parallel (FSDP) with FP32 Master Weights, FP16 Gradient Reductions, and Size-Based Layer Auto-Wrapping.")
+
 
 
 
