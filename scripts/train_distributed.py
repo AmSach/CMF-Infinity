@@ -101,19 +101,18 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision
             
-            # Cast CPU parameters to FP16 to avoid the initialization VRAM spike when FSDP copies unsharded params to GPU
-            model = model.half()
-            
+            # Keep master weights in FP32 on CPU during sharding to preserve high-precision initialization
             mp_policy = MixedPrecision(
-                param_dtype=torch.float16,
+                param_dtype=torch.float32,
                 reduce_dtype=torch.float16,
-                buffer_dtype=torch.float16
+                buffer_dtype=torch.float32
             )
             # Wrap on CPU first. FSDP will automatically shard and move parameters to local_rank GPU
             model = FSDP(model, device_id=local_rank, mixed_precision=mp_policy)
             is_fsdp = True
             if is_master:
-                print("Using Fully Sharded Data Parallel (FSDP) with FP16 Mixed Precision.")
+                print("Using Fully Sharded Data Parallel (FSDP) with FP32 Master Weights and FP16 Gradient Reductions.")
+
         else:
             model = model.to(device)
             model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
@@ -172,29 +171,41 @@ def train(args: argparse.Namespace) -> None:
         if is_master:
             print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights! ---")
         payload = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
-
-            
-        if is_fsdp:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                state_dict = payload["model"] if is_master else None
-                state_dict_list = [state_dict]
-                dist.broadcast_object_list(state_dict_list, src=0)
-                model.load_state_dict(state_dict_list[0])
-        else:
-            model.load_state_dict(payload["model"])
-            
-        start_step = payload["training"]["step"]
-        tokens_seen = payload["training"].get("tokens", 0)
         
-        # Step the scheduler to match the restored step count
-        for _ in range(start_step):
-            scheduler.step()
+        # Self-healing check: if the loaded weights contain NaNs, reset to step 0 to avoid infinite NaNs
+        has_nan = False
+        if "model" in payload:
+            for k, v in payload["model"].items():
+                if torch.is_tensor(v) and torch.isnan(v).any():
+                    has_nan = True
+                    break
+                    
+        if has_nan:
+            if is_master:
+                print("\n--- [WARNING] Found NaN weights in checkpoint! Resetting training from scratch to avoid infinite NaNs! ---\n")
+        else:
+            if is_fsdp:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                    state_dict = payload["model"] if is_master else None
+                    state_dict_list = [state_dict]
+                    dist.broadcast_object_list(state_dict_list, src=0)
+                    model.load_state_dict(state_dict_list[0])
+            else:
+                model.load_state_dict(payload["model"])
+                
+            start_step = payload["training"]["step"]
+            tokens_seen = payload["training"].get("tokens", 0)
             
-        if is_master:
-            print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+            # Step the scheduler to match the restored step count
+            for _ in range(start_step):
+                scheduler.step()
+                
+            if is_master:
+                print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+
 
 
     # Load data
