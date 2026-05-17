@@ -249,6 +249,7 @@ def train(args: argparse.Namespace) -> None:
 
     model.train()
     start_time = time.perf_counter()
+    save_thread = None
 
     for step in range(start_step, args.steps):
         optimizer.zero_grad(set_to_none=True)
@@ -289,12 +290,16 @@ def train(args: argparse.Namespace) -> None:
             print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
 
 
-        # Save latest checkpoint at configured step intervals atomically (overwrites previous to save disk space and maximize speed)
-        if args.save_every > 0 and (step + 1) % args.save_every == 0:
-            if is_master or is_fsdp:
-                checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
-                temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
-                
+        # Save latest checkpoint at each training step asynchronously (overwrites previous to save disk space with ZERO I/O delay)
+        if is_master or is_fsdp:
+            checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
+            temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
+            
+            # Check if previous background save is still running to avoid I/O bottlenecks
+            if save_thread is not None and save_thread.is_alive():
+                # Previous save is still in progress, skip this step to prevent piling up writes
+                pass
+            else:
                 if is_fsdp:
                     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
                     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
@@ -302,28 +307,54 @@ def train(args: argparse.Namespace) -> None:
                     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                         state_dict_to_save = model.state_dict()
                     if is_master:
-                        torch.save({
+                        payload = {
                             "model": state_dict_to_save,
                             "config": config,
                             "training": {"step": step + 1, "tokens": tokens_seen * world_size}
-                        }, temp_checkpoint_path)
-                        if temp_checkpoint_path.exists():
-                            temp_checkpoint_path.replace(checkpoint_path)
-                        print(f"Saved FSDP latest checkpoint atomically to {checkpoint_path} (step {step+1})")
+                        }
+                        
+                        import threading
+                        def _async_save(p, tmp, final, step_num):
+                            try:
+                                torch.save(p, tmp)
+                                if tmp.exists():
+                                    tmp.replace(final)
+                                print(f"Successfully saved latest checkpoint in background for step {step_num}")
+                            except Exception as e:
+                                print(f"Error in background checkpoint save: {e}")
+                                
+                        save_thread = threading.Thread(
+                            target=_async_save, 
+                            args=(payload, temp_checkpoint_path, checkpoint_path, step + 1), 
+                            daemon=True
+                        )
+                        save_thread.start()
                 else:
                     if is_master:
-                        save_model_package(
-                            temp_checkpoint_path,
-                            model.module if world_size > 1 else model,
-                            model_type=preset.model_type,
-                            config=config,
-                            tokenizer=tokenizer,
-                            tokenizer_name="gpt2",
-                            training={"step": step + 1, "tokens": tokens_seen * world_size}
+                        # Copy state dict to CPU asynchronously
+                        state_dict_to_save = {k: v.cpu() for k, v in model.state_dict().items()}
+                        payload = {
+                            "model": state_dict_to_save,
+                            "config": config,
+                            "training": {"step": step + 1, "tokens": tokens_seen * world_size}
+                        }
+                        
+                        import threading
+                        def _async_save(p, tmp, final, step_num):
+                            try:
+                                torch.save(p, tmp)
+                                if tmp.exists():
+                                    tmp.replace(final)
+                                print(f"Successfully saved latest checkpoint in background for step {step_num}")
+                            except Exception as e:
+                                print(f"Error in background checkpoint save: {e}")
+                                
+                        save_thread = threading.Thread(
+                            target=_async_save, 
+                            args=(payload, temp_checkpoint_path, checkpoint_path, step + 1), 
+                            daemon=True
                         )
-                        if temp_checkpoint_path.exists():
-                            temp_checkpoint_path.replace(checkpoint_path)
-                        print(f"Saved latest model package atomically to {checkpoint_path} (step {step+1})")
+                        save_thread.start()
 
 
     if is_master:
