@@ -68,6 +68,7 @@ def main():
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
 
         "--seq-len", "512",
+        "--steps", "45776",
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
