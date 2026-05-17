@@ -105,7 +105,8 @@ def train(args: argparse.Namespace) -> None:
         except Exception as exc:
             if is_master: print(f"torch.compile failed: {exc}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=(device.type == "cuda"))
+    use_fused = (device.type == "cuda") and not is_fsdp
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=use_fused)
     if is_fsdp:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
         scaler = ShardedGradScaler(enabled=args.amp and device.type == "cuda")

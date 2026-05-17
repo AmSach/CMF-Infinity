@@ -210,6 +210,7 @@ def cached_lm_batches_from_shards(
     generator.manual_seed(seed)
 
     while num_batches is None or produced < num_batches:
+        shards = list_token_cache_shards(path)
         if random_batches and len(shards) > 1:
             order = torch.randperm(len(shards), generator=generator).tolist()
             shard_order = [shards[idx] for idx in order]
