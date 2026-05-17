@@ -81,7 +81,9 @@ def main():
             "tokens_count": tensor.numel(),
             "dtype": "int32"
         }
-        torch.save({"tokens": tensor, **shard_meta}, args.output_dir / filename)
+        temp_filename = f"{filename}.tmp"
+        torch.save({"tokens": tensor, **shard_meta}, args.output_dir / temp_filename)
+        (args.output_dir / temp_filename).replace(args.output_dir / filename)
         with open(args.output_dir / f"{filename}.json", "w") as f:
             json.dump(shard_meta, f)
         return tensor.numel()

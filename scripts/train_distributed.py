@@ -31,6 +31,22 @@ from cmf.scalable_data import (
     load_token_cache_manifest,
 )
 
+def get_latest_tokenizer_log(log_path: Path) -> str | None:
+    if not log_path.exists():
+        return None
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            if not lines:
+                return None
+            for line in reversed(lines):
+                line = line.strip()
+                if line:
+                    return line
+    except Exception:
+        pass
+    return None
+
 def setup_distributed():
     if "RANK" in os.environ:
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
@@ -312,6 +328,13 @@ def train(args: argparse.Namespace) -> None:
                 eta_str = f"{hours}h {minutes}m"
                 
             print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f} eta={eta_str}")
+            
+            # Print latest tokenizer status alongside training logs cleanly
+            tok_log_file = args.checkpoint_dir.parent.parent / "tokenizer_output.log" if args.checkpoint_dir else None
+            if tok_log_file and tok_log_file.exists():
+                latest_tok_line = get_latest_tokenizer_log(tok_log_file)
+                if latest_tok_line:
+                    print(f"   [Tokenizer Status] {latest_tok_line}")
 
 
         # Save latest checkpoint at each training step asynchronously (overwrites previous to save disk space with ZERO I/O delay)
