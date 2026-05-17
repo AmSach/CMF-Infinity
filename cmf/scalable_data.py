@@ -93,7 +93,8 @@ def iter_token_batches_from_texts(
 
 
 def load_token_cache(path: str | Path) -> tuple[torch.Tensor, dict[str, Any]]:
-    payload = torch.load(Path(path), map_location="cpu")
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+
     if torch.is_tensor(payload):
         return payload.to(dtype=torch.long).flatten(), {"format": "raw_tensor"}
     if not isinstance(payload, dict) or "tokens" not in payload:

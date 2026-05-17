@@ -127,7 +127,7 @@ def load_model_package(
     strict: bool = True,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     path = Path(path)
-    payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(payload, dict) or payload.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(
             f"{path} is not a CMF model package. Expected format {CHECKPOINT_FORMAT}. "
@@ -154,7 +154,7 @@ def load_legacy_state_dict(
     strict: bool = True,
 ) -> nn.Module:
     model = _make_model(model_type, config_to_dict(config))
-    state = torch.load(Path(path), map_location=device)
+    state = torch.load(Path(path), map_location=device, weights_only=False)
     if not isinstance(state, dict):
         raise ValueError(f"Legacy checkpoint {path} did not contain a state_dict.")
     missing, unexpected = model.load_state_dict(state, strict=strict)
@@ -164,7 +164,7 @@ def load_legacy_state_dict(
 
 
 def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
-    payload = torch.load(Path(path), map_location="cpu")
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if isinstance(payload, dict) and payload.get("format") == CHECKPOINT_FORMAT:
         state = payload["state_dict"]
         return {

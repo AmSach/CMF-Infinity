@@ -171,7 +171,8 @@ def train(args: argparse.Namespace) -> None:
     if latest_ckpt.exists():
         if is_master:
             print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights! ---")
-        payload = torch.load(latest_ckpt, map_location="cpu")
+        payload = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+
             
         if is_fsdp:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
