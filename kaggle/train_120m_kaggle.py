@@ -72,6 +72,7 @@ def main():
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
+        "--compile",
         "--fsdp",
         "--log-every", "1",
         "--save-every", "500",
