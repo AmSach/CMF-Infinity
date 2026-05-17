@@ -3,6 +3,9 @@ import sys
 import subprocess
 from pathlib import Path
 
+# Resolve root path of the project absolute
+ROOT = Path(__file__).resolve().parents[1]
+
 def run(cmd):
     print(f"Executing: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
@@ -10,17 +13,17 @@ def run(cmd):
 def main():
     # 1. Install dependencies
     print("--- Installing dependencies ---")
-    run([sys.executable, "-m", "pip", "install", "-e", ".[scale,vision,power]"])
+    run([sys.executable, "-m", "pip", "install", "-e", str(ROOT / "[scale,vision,power]")])
     run([sys.executable, "-m", "pip", "install", "ninja"])
 
     # 2. Parallel Tokenization (Fast Path)
-    data_dir = Path("records/data/fineweb_edu_2b")
+    data_dir = ROOT / "records" / "data" / "fineweb_edu_2b"
     target_tokens = 20_000_000_000 # 20B tokens for the 2B model
     
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
         print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer ---")
         run([
-            sys.executable, "scripts/prepare_hf_token_parallel.py",
+            sys.executable, str(ROOT / "scripts" / "prepare_hf_token_parallel.py"),
             "--dataset", "HuggingFaceTB/smollm-corpus",
             "--dataset-name", "fineweb-edu-dedup",
             "--target-tokens", str(target_tokens),
@@ -37,7 +40,7 @@ def main():
     run([
         "torchrun",
         "--nproc_per_node=2",
-        "scripts/train_distributed.py",
+        str(ROOT / "scripts" / "train_distributed.py"),
         "--preset", "infinity-reasoning-2b",
         "--token-cache-dir", str(data_dir),
         "--micro-batch-size", "1",
@@ -49,7 +52,7 @@ def main():
         "--gradient-checkpointing",
         "--log-every", "1",
         "--save-every", "500",
-        "--package-out", "records/checkpoints/cmf_2b_reasoning.package.pt"
+        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_2b_reasoning.package.pt")
     ])
 
 if __name__ == "__main__":
