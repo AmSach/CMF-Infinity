@@ -79,6 +79,9 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision
             
+            # Cast CPU parameters to FP16 to avoid the initialization VRAM spike when FSDP copies unsharded params to GPU
+            model = model.half()
+            
             mp_policy = MixedPrecision(
                 param_dtype=torch.float16,
                 reduce_dtype=torch.float16,
