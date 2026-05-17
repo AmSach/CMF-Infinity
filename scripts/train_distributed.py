@@ -77,7 +77,7 @@ def train(args: argparse.Namespace) -> None:
     if world_size > 1:
         if args.fsdp and device.type == "cuda":
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.mixed_precision import MixedPrecision
+            from torch.distributed.fsdp import MixedPrecision
             
             mp_policy = MixedPrecision(
                 param_dtype=torch.float16,
