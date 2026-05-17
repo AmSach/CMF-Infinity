@@ -128,10 +128,18 @@ def train(args: argparse.Namespace) -> None:
                     print(f"Error unlinking corrupted checkpoint: {e}")
             else:
                 # Load weights into the unwrapped model on Rank 0 CPU
-                model.load_state_dict(payload["model"])
+                state_dict = payload["model"]
+                cleaned_state_dict = {}
+                for k, v in state_dict.items():
+                    # Strip any torch.compile _orig_mod. prefix if present
+                    if k.startswith("_orig_mod."):
+                        cleaned_state_dict[k[len("_orig_mod."):]] = v
+                    else:
+                        cleaned_state_dict[k] = v
+                model.load_state_dict(cleaned_state_dict)
                 start_step = payload["training"]["step"]
                 tokens_seen = payload["training"].get("tokens", 0)
-                print(f"Successfully loaded weights into unwrapped model on CPU. Ready for distributed wrapping!")
+                print(f"Successfully loaded weights into unwrapped model on CPU (cleaned _orig_mod prefix). Ready for distributed wrapping!")
 
     if world_size > 1:
         # Broadcast metadata so all ranks agree on start_step, tokens_seen, and has_nan status
