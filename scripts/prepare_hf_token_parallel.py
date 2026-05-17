@@ -41,6 +41,8 @@ def main():
     # or just non-streaming if we have enough RAM (Kaggle has 30GB).
     # For 10B tokens, we better use streaming to avoid OOM during download.
     dataset = load_dataset(args.dataset, args.dataset_name, split=args.split, streaming=True)
+    # Fully randomize data ingestion by shuffling the streamed dataset with a 20,000 example buffer
+    dataset = dataset.shuffle(seed=2026, buffer_size=20000)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     
     args.output_dir.mkdir(parents=True, exist_ok=True)

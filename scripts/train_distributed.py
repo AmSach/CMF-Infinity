@@ -243,7 +243,9 @@ def train(args: argparse.Namespace) -> None:
             elapsed = time.perf_counter() - start_time
             total_tokens = tokens_seen * world_size
             current_lr = scheduler.get_last_lr()[0]
-            print(f"step={step+1}/{args.steps} loss={step_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
+            avg_loss = step_loss / args.grad_accum
+            print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
+
 
         # Save latest checkpoint at each training step atomically (overwrites previous to save disk space)
         if is_master or is_fsdp:
