@@ -13,12 +13,12 @@ def run(cmd):
 def main():
     # 1. Install dependencies
     print("--- Installing dependencies ---")
-    run([sys.executable, "-m", "pip", "install", "-e", str(ROOT / "[scale,vision,power]")])
+    run([sys.executable, "-m", "pip", "install", "-e", f"{str(ROOT)}[scale,vision,power]"])
     run([sys.executable, "-m", "pip", "install", "ninja"])
 
     # 2. Parallel Tokenization (Fast Path)
     data_dir = ROOT / "records" / "data" / "fineweb_edu_2b"
-    target_tokens = 20_000_000_000 # 20B tokens for the 2B model
+    target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
     
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
         print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer ---")
@@ -27,7 +27,7 @@ def main():
             "--dataset", "HuggingFaceTB/smollm-corpus",
             "--dataset-name", "fineweb-edu-dedup",
             "--target-tokens", str(target_tokens),
-            "--shard-tokens", "200000000",
+            "--shard-tokens", "25000000",
             "--output-dir", str(data_dir),
             "--append-eos"
         ])
