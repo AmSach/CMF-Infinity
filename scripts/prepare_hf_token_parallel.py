@@ -25,11 +25,10 @@ def main():
     parser.add_argument("--append-eos", action="store_true")
     args = parser.parse_args()
 
-    print(f"Loading dataset split train[:2000000] from {args.dataset} (streaming=False for parallel download)...")
+    print(f"Loading dataset {args.dataset} (streaming=True for instant startup)...")
     
-    # Load dataset slice non-streaming to download required parquet files in parallel at max network speed (~150MB/s)
-    # 2,000,000 rows will easily yield 2.0+ Billion tokens of high-quality FineWeb-Edu text.
-    dataset = load_dataset(args.dataset, args.dataset_name, split="train[:2000000]", streaming=False)
+    # Load dataset streaming to fetch only required files on-the-fly, bypassing the 350GB download choke
+    dataset = load_dataset(args.dataset, args.dataset_name, split=args.split, streaming=True)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -44,28 +43,17 @@ def main():
                 tokens_saved += payload["tokens"].numel()
             except Exception as e:
                 print(f"Warning: Failed to load existing shard {shard_file}: {e}")
-        print(f"\n--- [RESUME] Found {len(existing_shards)} existing shards on disk ({tokens_saved:,} tokens). Resuming... ---\n")
-
-    # True multi-processed tokenization using PyArrow/C++ and Rust FastTokenizer
-    print(f"Tokenizing dataset in parallel using {args.num_proc} processes...")
-    def tokenize_func(batch):
-        return tokenizer(batch[args.text_column], add_special_tokens=False)
-        
-    tokenized_dataset = dataset.map(
-        tokenize_func,
-        batched=True,
-        batch_size=5000,
-        num_proc=args.num_proc,
-        remove_columns=dataset.column_names
-    )
-    
-    print("\n--- Parallel tokenization complete! Writing shards to disk... ---\n")
+        print(f"\n--- [RESUME] Found {len(existing_shards)} existing shards on disk ({tokens_saved:,} tokens). Fast-forwarding generator... ---\n")
 
     tokens_seen = 0
     shard_idx = 0
     shard_tokens = []
-    shard_token_count = 0
+    
     start_time = time.perf_counter()
+    
+    # High-speed batch processing leverages HF Tokenizer's internal C++/Rust parallel threads
+    batch_size = 5000
+    current_batch = []
     
     def save_shard(tokens_list, idx):
         flat_tokens = [t for sublist in tokens_list for t in sublist]
@@ -85,33 +73,81 @@ def main():
             json.dump(shard_meta, f)
         return tensor.numel()
 
-    for row in tokenized_dataset:
-        ids = row["input_ids"]
-        if args.append_eos:
-            ids.append(tokenizer.eos_token_id)
-            
-        count = len(ids)
-        if tokens_seen < tokens_saved:
-            tokens_seen += count
-            continue
-            
-        shard_tokens.append(ids)
-        shard_token_count += count
-        tokens_seen += count
+    shard_token_count = 0
+    skipped_tokens = 0
+    skipping_mode = (tokens_saved > 0)
+    
+    for row in dataset:
+        current_batch.append(row[args.text_column])
         
-        if shard_token_count >= args.shard_tokens:
-            save_shard(shard_tokens, shard_idx)
-            elapsed = time.perf_counter() - start_time
-            tok_s = (tokens_seen - tokens_saved) / max(elapsed, 1e-6)
-            percentage = (tokens_seen / args.target_tokens) * 100.0
-            print(f"[SHARD WRITTEN] Saved shard {shard_idx} ({shard_token_count:,} tokens). Total: {tokens_seen:,}/{args.target_tokens:,} tokens ({percentage:.1f}%) | Speed: {tok_s:.0f} tok/s")
-            shard_idx += 1
-            shard_tokens = []
-            shard_token_count = 0
+        if len(current_batch) >= batch_size:
+            # Tokenize batch in parallel via HF Tokenizer Rust multi-threading
+            tokenized = tokenizer(current_batch, add_special_tokens=False)["input_ids"]
             
-        if tokens_seen >= args.target_tokens:
-            break
+            # Ultra-fast batch skipping to bypass Python row loop bottleneck
+            if skipping_mode:
+                batch_counts = [len(ids) + (1 if args.append_eos else 0) for ids in tokenized]
+                sum_counts = sum(batch_counts)
+                if skipped_tokens + sum_counts < tokens_saved:
+                    skipped_tokens += sum_counts
+                    current_batch = []
+                    
+                    # Print fast-forward logs occasionally
+                    pct = (skipped_tokens / tokens_saved) * 100.0
+                    print(f"[Fast-Forward] Skipping already processed data... {skipped_tokens:,} / {tokens_saved:,} tokens skipped ({pct:.1f}%)", end="\r", flush=True)
+                    continue
             
+            # Boundary transition or active tokenization
+            for ids in tokenized:
+                if args.append_eos:
+                    ids.append(tokenizer.eos_token_id)
+                
+                count = len(ids)
+                if skipping_mode:
+                    skipped_tokens += count
+                    if skipped_tokens >= tokens_saved:
+                        skipping_mode = False
+                        tokens_seen = tokens_saved
+                        shard_idx = len(existing_shards)
+                        print(f"\n--- [RESUME COMPLETE] Fast-forwarded past {tokens_saved:,} tokens. Resuming tokenization at Shard {shard_idx}! ---\n")
+                    continue
+                
+                shard_tokens.append(ids)
+                shard_token_count += count
+                tokens_seen += count
+                
+                if shard_token_count >= args.shard_tokens:
+                    save_shard(shard_tokens, shard_idx)
+                    print(f"\n[SHARD WRITTEN] Saved shard {shard_idx} ({shard_token_count:,} tokens). Total: {tokens_seen:,}/{args.target_tokens:,} tokens.\n")
+                    shard_idx += 1
+                    shard_tokens = []
+                    shard_token_count = 0
+            
+            # Print real-time progress update
+            if not skipping_mode:
+                elapsed = time.perf_counter() - start_time
+                tok_s = (tokens_seen - tokens_saved) / max(elapsed, 1e-6)
+                percentage = (tokens_seen / args.target_tokens) * 100.0
+                
+                # Estimate ETA
+                remaining_tokens = max(0, args.target_tokens - tokens_seen)
+                eta_seconds = remaining_tokens / max(tok_s, 1e-6)
+                
+                if eta_seconds > 3600:
+                    eta_str = f"{eta_seconds / 3600:.2f} hrs"
+                elif eta_seconds > 60:
+                    eta_str = f"{eta_seconds / 60:.2f} mins"
+                else:
+                    eta_str = f"{eta_seconds:.0f} secs"
+                    
+                print(f"[Progress] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
+                      f"Shard {shard_idx} progress: {shard_token_count:,}/{args.shard_tokens:,} | "
+                      f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
+            
+            current_batch = []
+            if tokens_seen >= args.target_tokens:
+                break
+                
     if shard_tokens and tokens_seen < args.target_tokens:
         save_shard(shard_tokens, shard_idx)
         shard_idx += 1
