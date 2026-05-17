@@ -5,9 +5,11 @@ import json
 import os
 import sys
 import time
+import math
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -54,6 +56,21 @@ def build_model(model_type: str, config: CMFConfig) -> torch.nn.Module:
         return DeliberativeContinuousMeaningField(config)
     raise ValueError(f"Unsupported model_type: {model_type}")
 
+def initialize_weights(model: torch.nn.Module, num_layers: int):
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            
+            # Scale down the output projection layers inside residual blocks and deliberative gates
+            # to guarantee stable residual activation variance propagation in deep models
+            if "proj" in name or "proposal" in name or "gate" in name or "update_gate" in name:
+                with torch.no_grad():
+                    module.weight.data.mul_(1.0 / math.sqrt(2.0 * num_layers))
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 def train(args: argparse.Namespace) -> None:
     rank, local_rank, world_size, device = setup_distributed()
     is_master = (rank == 0)
@@ -73,6 +90,11 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model(preset.model_type, config)
     
+    # 1. Apply robust neural weight initialization
+    if is_master:
+        print("Initializing model weights using scaled residual initialization...")
+    initialize_weights(model, config.num_layers)
+
     is_fsdp = False
     if world_size > 1:
         if args.fsdp and device.type == "cuda":
@@ -107,12 +129,65 @@ def train(args: argparse.Namespace) -> None:
 
     use_fused = (device.type == "cuda") and not is_fsdp
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=use_fused)
+    
+    # 2. Add Cosine Warmup Learning Rate Scheduler for ultimate stability
+    from torch.optim.lr_scheduler import LambdaLR
+    def lr_lambda(current_step: int):
+        warmup_steps = 100
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, args.steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
     if is_fsdp:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
         scaler = ShardedGradScaler(enabled=args.amp and device.type == "cuda")
     else:
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     
+    # 3. Load default gpt2 tokenizer safely on master for saving standalone packages
+    tokenizer = None
+    if is_master:
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        except Exception as e:
+            print(f"Warning: Could not load default gpt2 tokenizer: {e}")
+
+    # 4. Implement Automatic Checkpoint Resume System (FSDP compatible)
+    start_step = 0
+    tokens_seen = 0
+    if args.checkpoint_dir.exists():
+        ckpt_files = sorted(args.checkpoint_dir.glob("checkpoint_step_*.pt"), key=lambda p: int(p.stem.split("_")[-1]))
+        if ckpt_files:
+            latest_ckpt = ckpt_files[-1]
+            if is_master:
+                print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights! ---")
+            payload = torch.load(latest_ckpt, map_location="cpu")
+            
+            if is_fsdp:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                    state_dict = payload["model"] if is_master else None
+                    state_dict_list = [state_dict]
+                    dist.broadcast_object_list(state_dict_list, src=0)
+                    model.load_state_dict(state_dict_list[0])
+            else:
+                model.load_state_dict(payload["model"])
+                
+            start_step = payload["training"]["step"]
+            tokens_seen = payload["training"].get("tokens", 0)
+            
+            # Step the scheduler to match the restored step count
+            for _ in range(start_step):
+                scheduler.step()
+                
+            if is_master:
+                print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+
     # Load data
     # We use rank-specific seeds to ensure different ranks see different data shards/samples
     batches = cached_lm_batches_from_shards(
@@ -127,14 +202,17 @@ def train(args: argparse.Namespace) -> None:
 
     model.train()
     start_time = time.perf_counter()
-    tokens_seen = 0
 
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
         
         for _ in range(args.grad_accum):
-            x, y = next(batches)
+            try:
+                x, y = next(batches)
+            except StopIteration:
+                if is_master: print("--- Data exhausted. Ending training. ---")
+                break
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             
             with torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
@@ -154,11 +232,13 @@ def train(args: argparse.Namespace) -> None:
         
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         if is_master and (step + 1) % args.log_every == 0:
             elapsed = time.perf_counter() - start_time
             total_tokens = tokens_seen * world_size
-            print(f"step={step+1}/{args.steps} loss={step_loss:.4f} tokens={total_tokens:,} tok/s={total_tokens/elapsed:.0f}")
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"step={step+1}/{args.steps} loss={step_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
 
         if is_master and (step + 1) % args.save_every == 0:
             checkpoint_path = args.checkpoint_dir / f"checkpoint_step_{step+1}.pt"
@@ -177,12 +257,15 @@ def train(args: argparse.Namespace) -> None:
                     print(f"Saved FSDP step checkpoint to {checkpoint_path}")
             else:
                 save_model_package(
-                    args.package_out,
+                    checkpoint_path,
                     model.module if world_size > 1 else model,
                     model_type=preset.model_type,
                     config=config,
+                    tokenizer=tokenizer,
+                    tokenizer_name="gpt2",
                     training={"step": step + 1, "tokens": tokens_seen * world_size}
                 )
+                print(f"Saved model package step checkpoint to {checkpoint_path}")
 
     if is_master:
         print("Training complete.")
@@ -205,6 +288,8 @@ def train(args: argparse.Namespace) -> None:
                 model.module if world_size > 1 else model,
                 model_type=preset.model_type,
                 config=config,
+                tokenizer=tokenizer,
+                tokenizer_name="gpt2",
                 training={"step": args.steps, "tokens": tokens_seen * world_size}
             )
 
