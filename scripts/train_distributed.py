@@ -101,9 +101,11 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision
             
-            # Keep master weights in FP32 on CPU during sharding to preserve high-precision initialization
+            # Cast CPU parameters to FP16 to avoid the initialization VRAM spike when FSDP copies unsharded params to GPU
+            model = model.half()
+            
             mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
+                param_dtype=torch.float16,
                 reduce_dtype=torch.float16,
                 buffer_dtype=torch.float32
             )
@@ -111,7 +113,8 @@ def train(args: argparse.Namespace) -> None:
             model = FSDP(model, device_id=local_rank, mixed_precision=mp_policy)
             is_fsdp = True
             if is_master:
-                print("Using Fully Sharded Data Parallel (FSDP) with FP32 Master Weights and FP16 Gradient Reductions.")
+                print("Using Fully Sharded Data Parallel (FSDP) with FP16 Parameters and FP32 Buffers.")
+
 
         else:
             model = model.to(device)
@@ -182,7 +185,12 @@ def train(args: argparse.Namespace) -> None:
                     
         if has_nan:
             if is_master:
-                print("\n--- [WARNING] Found NaN weights in checkpoint! Resetting training from scratch to avoid infinite NaNs! ---\n")
+                print("\n--- [WARNING] Found NaN weights in checkpoint! Deleting corrupted checkpoint and resetting training from scratch to avoid infinite NaNs! ---\n")
+                try:
+                    latest_ckpt.unlink()
+                except Exception as e:
+                    print(f"Error unlinking corrupted checkpoint: {e}")
+
         else:
             if is_fsdp:
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP

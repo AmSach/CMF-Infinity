@@ -65,7 +65,8 @@ def main():
         "--token-cache-dir", str(data_dir),
         "--micro-batch-size", "1",
         "--grad-accum", "32",
-        "--lr", "1e-3",
+        "--lr", "5e-5",
+
         "--seq-len", "512",
         "--amp",
         "--tf32",
