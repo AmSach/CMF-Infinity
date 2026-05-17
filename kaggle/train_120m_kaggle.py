@@ -63,8 +63,8 @@ def main():
         str(ROOT / "scripts" / "train_distributed.py"),
         "--preset", "infinity-reasoning-0.12b",
         "--token-cache-dir", str(data_dir),
-        "--micro-batch-size", "16",
-        "--grad-accum", "2",
+        "--micro-batch-size", "32",
+        "--grad-accum", "1",
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
 
         "--seq-len", "512",
