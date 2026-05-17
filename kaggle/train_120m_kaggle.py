@@ -63,8 +63,8 @@ def main():
         str(ROOT / "scripts" / "train_distributed.py"),
         "--preset", "infinity-reasoning-0.12b",
         "--token-cache-dir", str(data_dir),
-        "--micro-batch-size", "8",
-        "--grad-accum", "4",
+        "--micro-batch-size", "16",
+        "--grad-accum", "2",
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
 
         "--seq-len", "512",
@@ -75,7 +75,7 @@ def main():
         "--compile",
         "--fsdp",
         "--log-every", "1",
-        "--save-every", "5",
+        "--save-every", "15",
         "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_120m_reasoning.package.pt"),
         "--checkpoint-dir", str(ROOT / "records" / "checkpoints" / "cmf_120m_steps")
     ])
