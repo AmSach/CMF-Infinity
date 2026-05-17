@@ -337,15 +337,23 @@ def train(args: argparse.Namespace) -> None:
                     print(f"   [Tokenizer Status] {latest_tok_line}")
 
 
-        # Save latest checkpoint at each training step asynchronously (overwrites previous to save disk space with ZERO I/O delay)
-        if is_master or is_fsdp:
+        # Save latest checkpoint according to args.save_every asynchronously (with FSDP collective synchronization to prevent deadlocks)
+        if (step + 1) % args.save_every == 0 and (is_master or is_fsdp):
             checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
             temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
             
-            # Check if previous background save is still running to avoid I/O bottlenecks
-            if save_thread is not None and save_thread.is_alive():
-                # Previous save is still in progress, skip this step to prevent piling up writes
-                pass
+            should_skip = False
+            if world_size > 1:
+                # Coordinate collectively across all ranks to prevent FSDP deadlocks
+                skip_tensor = torch.tensor([1 if (is_master and save_thread is not None and save_thread.is_alive()) else 0], dtype=torch.int, device=device)
+                dist.broadcast(skip_tensor, src=0)
+                should_skip = (skip_tensor.item() == 1)
+            else:
+                should_skip = (save_thread is not None and save_thread.is_alive())
+                
+            if should_skip:
+                if is_master:
+                    print(f"   [Checkpoint] Previous background save is still in progress, skipping save at step {step + 1} to prevent I/O bottlenecks.")
             else:
                 if is_fsdp:
                     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
