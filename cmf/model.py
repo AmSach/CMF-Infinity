@@ -179,6 +179,7 @@ class ContinuousMeaningField(nn.Module):
         goal: Optional[torch.Tensor] = None,
         target_length: Optional[int] = None,
         return_states: bool = False,
+        gradient_checkpointing: bool = False,
     ) -> dict[str, torch.Tensor]:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
@@ -279,6 +280,7 @@ class ParallelContinuousMeaningField(nn.Module):
         goal: Optional[torch.Tensor] = None,
         target_length: Optional[int] = None,
         return_states: bool = False,
+        gradient_checkpointing: bool = False,
     ) -> dict[str, torch.Tensor]:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
@@ -382,6 +384,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         goal: Optional[torch.Tensor] = None,
         target_length: Optional[int] = None,
         return_states: bool = False,
+        gradient_checkpointing: bool = False,
     ) -> dict[str, torch.Tensor]:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
@@ -391,7 +394,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         if target_length > seq_len:
             raise ValueError("DeliberativeContinuousMeaningField cannot extrapolate target_length")
 
-        context = self.encoder(self.embedding(input_ids))[:, :target_length]
+        context = self.encoder(self.embedding(input_ids), gradient_checkpointing=gradient_checkpointing)[:, :target_length]
         z = self.initial_state(context)
         goal_sequence = _goal_like(goal, z)
         steps = self._thinking_budget()
@@ -508,6 +511,7 @@ class FastParallelContinuousMeaningField(nn.Module):
         goal: Optional[torch.Tensor] = None,
         target_length: Optional[int] = None,
         return_states: bool = False,
+        gradient_checkpointing: bool = False,
     ) -> dict[str, torch.Tensor]:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
@@ -517,7 +521,7 @@ class FastParallelContinuousMeaningField(nn.Module):
         if target_length > seq_len:
             raise ValueError("FastParallelContinuousMeaningField cannot extrapolate target_length")
 
-        context = self.encoder(self.embedding(input_ids))[:, :target_length]
+        context = self.encoder(self.embedding(input_ids), gradient_checkpointing=gradient_checkpointing)[:, :target_length]
         z = self.initial_state(context)
         
         # Memory attention
