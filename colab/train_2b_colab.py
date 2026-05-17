@@ -22,9 +22,14 @@ def main():
         print("This script is intended to be run inside a Google Colab notebook.")
         return
 
-    # 1. Mount Google Drive for persistent checkpoints
-    from google.colab import drive
-    drive.mount('/content/drive')
+    # 1. Mount Google Drive for persistent checkpoints if not already mounted
+    if not Path("/content/drive/MyDrive").exists():
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+        except Exception as exc:
+            print(f"Could not mount drive interactively: {exc}")
+            print("Please mount drive from the Colab sidebar or using a cell command instead.")
     
     drive_root = Path("/content/drive/MyDrive/CMF_Training_2B")
     drive_root.mkdir(parents=True, exist_ok=True)
