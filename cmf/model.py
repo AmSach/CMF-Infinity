@@ -78,7 +78,7 @@ class DilatedContextEncoder(nn.Module):
         super().__init__()
         blocks = []
         for layer_idx in range(config.num_layers):
-            dilation = 2 ** layer_idx
+            dilation = 2 ** (layer_idx % 6)
             blocks.append(
                 DilatedResidualBlock(
                     d_model=config.d_model,

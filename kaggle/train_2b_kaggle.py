@@ -36,16 +36,16 @@ def main():
     else:
         tok_proc = None
 
-    # 3. Start Deep 2B Reasoning Training
-    print("--- Starting Deep 2B Reasoning Training (2x T4) ---")
-    # Using gradient-checkpointing to squeeze a 2B model into 16GB VRAM
+    # 3. Start Deep 1.2B Reasoning Training
+    print("--- Starting Deep 1.2B Reasoning Training (2x T4) ---")
+    # Using gradient-checkpointing to squeeze a 1.2B model into 16GB VRAM
     # We use a micro-batch of 1 per GPU due to the massive depth/size
     # but compensate with high grad-accum.
     run([
         "torchrun",
         "--nproc_per_node=2",
         str(ROOT / "scripts" / "train_distributed.py"),
-        "--preset", "infinity-reasoning-2b",
+        "--preset", "infinity-reasoning-1.2b",
         "--token-cache-dir", str(data_dir),
         "--micro-batch-size", "1",
         "--grad-accum", "32",
@@ -57,7 +57,7 @@ def main():
         "--fsdp",
         "--log-every", "1",
         "--save-every", "500",
-        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_2b_reasoning.package.pt")
+        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_1.2b_reasoning.package.pt")
     ])
 
     if tok_proc is not None:
