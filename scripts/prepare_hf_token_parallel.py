@@ -90,10 +90,30 @@ def main():
                 
                 if shard_token_count >= args.shard_tokens:
                     save_shard(shard_tokens, shard_idx)
-                    print(f"Wrote shard {shard_idx}, tokens={tokens_seen:,}, tok/s={tokens_seen/(time.perf_counter()-start_time):.0f}")
+                    print(f"\n[SHARD WRITTEN] Saved shard {shard_idx} ({shard_token_count:,} tokens). Total: {tokens_seen:,}/{args.target_tokens:,} tokens.\n")
                     shard_idx += 1
                     shard_tokens = []
                     shard_token_count = 0
+            
+            # Print real-time progress update
+            elapsed = time.perf_counter() - start_time
+            tok_s = tokens_seen / max(elapsed, 1e-6)
+            percentage = (tokens_seen / args.target_tokens) * 100.0
+            
+            # Estimate ETA
+            remaining_tokens = max(0, args.target_tokens - tokens_seen)
+            eta_seconds = remaining_tokens / max(tok_s, 1e-6)
+            
+            if eta_seconds > 3600:
+                eta_str = f"{eta_seconds / 3600:.2f} hrs"
+            elif eta_seconds > 60:
+                eta_str = f"{eta_seconds / 60:.2f} mins"
+            else:
+                eta_str = f"{eta_seconds:.0f} secs"
+                
+            print(f"[Progress] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
+                  f"Shard {shard_idx} progress: {shard_token_count:,}/{args.shard_tokens:,} | "
+                  f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
             
             current_batch = []
             if tokens_seen >= args.target_tokens:
