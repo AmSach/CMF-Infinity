@@ -288,68 +288,41 @@ def train(args: argparse.Namespace) -> None:
             print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
 
 
-        # Save latest checkpoint at each training step atomically (overwrites previous to save disk space)
-        if is_master or is_fsdp:
-            checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
-            temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
-            
-            if is_fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict_to_save = model.state_dict()
-                if is_master:
-                    torch.save({
-                        "model": state_dict_to_save,
-                        "config": config,
-                        "training": {"step": step + 1, "tokens": tokens_seen * world_size}
-                    }, temp_checkpoint_path)
-                    if temp_checkpoint_path.exists():
-                        temp_checkpoint_path.replace(checkpoint_path)
-                    print(f"Saved FSDP latest checkpoint atomically to {checkpoint_path}")
-            else:
-                if is_master:
-                    save_model_package(
-                        temp_checkpoint_path,
-                        model.module if world_size > 1 else model,
-                        model_type=preset.model_type,
-                        config=config,
-                        tokenizer=tokenizer,
-                        tokenizer_name="gpt2",
-                        training={"step": step + 1, "tokens": tokens_seen * world_size}
-                    )
-                    if temp_checkpoint_path.exists():
-                        temp_checkpoint_path.replace(checkpoint_path)
-                    print(f"Saved latest model package atomically to {checkpoint_path}")
-
-        # Also save milestone step-checkpoints if requested
-        if is_master and args.save_every > 0 and (step + 1) % args.save_every == 0:
-            checkpoint_path = args.checkpoint_dir / f"checkpoint_step_{step+1}.pt"
-            if is_fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict_to_save = model.state_dict()
-                if is_master:
-                    torch.save({
-                        "model": state_dict_to_save,
-                        "config": config,
-                        "training": {"step": step + 1, "tokens": tokens_seen * world_size}
-                    }, checkpoint_path)
-                    print(f"Saved FSDP milestone step checkpoint to {checkpoint_path}")
-            else:
-                save_model_package(
-                    checkpoint_path,
-                    model.module if world_size > 1 else model,
-                    model_type=preset.model_type,
-                    config=config,
-                    tokenizer=tokenizer,
-                    tokenizer_name="gpt2",
-                    training={"step": step + 1, "tokens": tokens_seen * world_size}
-                )
-                print(f"Saved milestone model package step checkpoint to {checkpoint_path}")
+        # Save latest checkpoint at configured step intervals atomically (overwrites previous to save disk space and maximize speed)
+        if args.save_every > 0 and (step + 1) % args.save_every == 0:
+            if is_master or is_fsdp:
+                checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
+                temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
+                
+                if is_fsdp:
+                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                        state_dict_to_save = model.state_dict()
+                    if is_master:
+                        torch.save({
+                            "model": state_dict_to_save,
+                            "config": config,
+                            "training": {"step": step + 1, "tokens": tokens_seen * world_size}
+                        }, temp_checkpoint_path)
+                        if temp_checkpoint_path.exists():
+                            temp_checkpoint_path.replace(checkpoint_path)
+                        print(f"Saved FSDP latest checkpoint atomically to {checkpoint_path} (step {step+1})")
+                else:
+                    if is_master:
+                        save_model_package(
+                            temp_checkpoint_path,
+                            model.module if world_size > 1 else model,
+                            model_type=preset.model_type,
+                            config=config,
+                            tokenizer=tokenizer,
+                            tokenizer_name="gpt2",
+                            training={"step": step + 1, "tokens": tokens_seen * world_size}
+                        )
+                        if temp_checkpoint_path.exists():
+                            temp_checkpoint_path.replace(checkpoint_path)
+                        print(f"Saved latest model package atomically to {checkpoint_path} (step {step+1})")
 
 
     if is_master:
