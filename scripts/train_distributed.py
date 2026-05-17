@@ -148,9 +148,9 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
             import functools
             
-            # Keep master weights in FP32 on CPU during sharding to preserve high-precision initialization
+            # Keep parameters in FP16 on GPU VRAM for massive memory savings and Tensor Core speed
             mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
+                param_dtype=torch.float16,
                 reduce_dtype=torch.float16,
                 buffer_dtype=torch.float32
             )
