@@ -21,8 +21,9 @@ def main():
     target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
     
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
-        print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer ---")
-        run([
+        print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer (BACKGROUND PROCESS) ---")
+        # Launch tokenization as a background process so training can start concurrently
+        tok_proc = subprocess.Popen([
             sys.executable, str(ROOT / "scripts" / "prepare_hf_token_parallel.py"),
             "--dataset", "HuggingFaceTB/smollm-corpus",
             "--dataset-name", "fineweb-edu-dedup",
@@ -31,6 +32,9 @@ def main():
             "--output-dir", str(data_dir),
             "--append-eos"
         ])
+        print("--- Parallel Tokenizer launched in background. ---")
+    else:
+        tok_proc = None
 
     # 3. Start Deep 2B Reasoning Training
     print("--- Starting Deep 2B Reasoning Training (2x T4) ---")
@@ -54,6 +58,10 @@ def main():
         "--save-every", "500",
         "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_2b_reasoning.package.pt")
     ])
+
+    if tok_proc is not None:
+        print("Waiting for background parallel tokenizer to finish...")
+        tok_proc.wait()
 
 if __name__ == "__main__":
     main()

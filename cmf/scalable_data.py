@@ -116,9 +116,22 @@ def list_token_cache_shards(path: str | Path) -> list[Path]:
         paths = [root / str(item["path"]) for item in shards if "path" in item]
     else:
         paths = sorted(root.glob("*.pt"))
+    import time
     paths = [path for path in paths if path.exists() and not path.name.endswith(".package.pt")]
     if not paths:
-        raise ValueError(f"No token cache shards found in {root}")
+        print(f"--- [JIT Loader] Waiting for first token cache shard to appear in {root}... ---")
+        while not paths:
+            time.sleep(1.0)
+            if manifest.exists():
+                try:
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    shards = payload.get("shards", [])
+                    paths = [root / str(item["path"]) for item in shards if "path" in item]
+                except Exception:
+                    pass
+            else:
+                paths = sorted(root.glob("*.pt"))
+            paths = [path for path in paths if path.exists() and not path.name.endswith(".package.pt")]
     return paths
 
 
