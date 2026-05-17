@@ -20,6 +20,12 @@ def main():
     data_dir = ROOT / "records" / "data" / "fineweb_edu_2b"
     target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
     
+    # Kill any zombie tokenizer processes from aborted runs to prevent file locks/contention
+    try:
+        subprocess.run(["pkill", "-f", "prepare_hf_token_parallel.py"], capture_output=True)
+    except Exception:
+        pass
+    
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
         # Count existing shards to reassure the user
         existing_shards = sorted(data_dir.glob("tokens_*.pt")) if data_dir.exists() else []
