@@ -54,6 +54,7 @@ def main():
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
+        "--fsdp",
         "--log-every", "1",
         "--save-every", "500",
         "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_2b_reasoning.package.pt")

@@ -73,8 +73,23 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model(preset.model_type, config).to(device)
     
+    is_fsdp = False
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        if args.fsdp and device.type == "cuda":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.mixed_precision import MixedPrecision
+            
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16
+            )
+            model = FSDP(model, device_id=local_rank, mixed_precision=mp_policy)
+            is_fsdp = True
+            if is_master:
+                print("Using Fully Sharded Data Parallel (FSDP) with FP16 Mixed Precision.")
+        else:
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
     if args.compile:
         try:
@@ -84,7 +99,11 @@ def train(args: argparse.Namespace) -> None:
             if is_master: print(f"torch.compile failed: {exc}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=(device.type == "cuda"))
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    if is_fsdp:
+        from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+        scaler = ShardedGradScaler(enabled=args.amp and device.type == "cuda")
+    else:
+        scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     
     # Load data
     # We use rank-specific seeds to ensure different ranks see different data shards/samples
@@ -120,7 +139,10 @@ def train(args: argparse.Namespace) -> None:
 
         if args.clip_grad_norm > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            if is_fsdp:
+                model.clip_grad_norm_(args.clip_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
         
         scaler.step(optimizer)
         scaler.update()
@@ -132,16 +154,51 @@ def train(args: argparse.Namespace) -> None:
 
         if is_master and (step + 1) % args.save_every == 0:
             checkpoint_path = args.checkpoint_dir / f"checkpoint_step_{step+1}.pt"
+            if is_fsdp:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                    state_dict_to_save = model.state_dict()
+                if is_master:
+                    torch.save({
+                        "model": state_dict_to_save,
+                        "config": config,
+                        "training": {"step": step + 1, "tokens": tokens_seen * world_size}
+                    }, checkpoint_path)
+                    print(f"Saved FSDP step checkpoint to {checkpoint_path}")
+            else:
+                save_model_package(
+                    args.package_out,
+                    model.module if world_size > 1 else model,
+                    model_type=preset.model_type,
+                    config=config,
+                    training={"step": step + 1, "tokens": tokens_seen * world_size}
+                )
+
+    if is_master:
+        print("Training complete.")
+        if is_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict_to_save = model.state_dict()
+            if is_master:
+                torch.save({
+                    "model": state_dict_to_save,
+                    "config": config,
+                    "model_type": preset.model_type
+                }, args.package_out)
+                print(f"Final gathered model package saved to {args.package_out}")
+        else:
             save_model_package(
                 args.package_out,
                 model.module if world_size > 1 else model,
                 model_type=preset.model_type,
                 config=config,
-                training={"step": step + 1, "tokens": tokens_seen * world_size}
+                training={"step": args.steps, "tokens": tokens_seen * world_size}
             )
-
-    if is_master:
-        print(f"Training complete. Final package saved to {args.package_out}")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -162,6 +219,7 @@ def main():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--cache-batches-per-shard", type=int, default=512)
     parser.add_argument("--seq-len", type=int)
+    parser.add_argument("--fsdp", action="store_true", help="Enable Fully Sharded Data Parallel (FSDP)")
     parser.add_argument("--package-out", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_final.package.pt")
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_steps")
     args = parser.parse_args()
