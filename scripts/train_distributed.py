@@ -95,6 +95,50 @@ def train(args: argparse.Namespace) -> None:
         print("Initializing model weights using scaled residual initialization...")
     initialize_weights(model, config.num_layers)
 
+    # 2. Check and load checkpoint BEFORE wrapping in FSDP/DDP to avoid CPU/GPU memory spikes
+    checkpoint_exists = False
+    start_step = 0
+    tokens_seen = 0
+    has_nan = False
+    
+    latest_ckpt = args.checkpoint_dir / "checkpoint_latest.pt"
+    if not latest_ckpt.exists() and args.checkpoint_dir.exists():
+        ckpt_files = sorted(args.checkpoint_dir.glob("checkpoint_step_*.pt"), key=lambda p: int(p.stem.split("_")[-1]))
+        if ckpt_files:
+            latest_ckpt = ckpt_files[-1]
+
+    if is_master:
+        if latest_ckpt.exists():
+            checkpoint_exists = True
+            print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights on Rank 0 CPU! ---")
+            payload = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+            
+            # Check for NaNs
+            if "model" in payload:
+                for k, v in payload["model"].items():
+                    if torch.is_tensor(v) and torch.isnan(v).any():
+                        has_nan = True
+                        break
+            
+            if has_nan:
+                print("\n--- [WARNING] Found NaN weights in checkpoint! Deleting corrupted checkpoint and resetting training from scratch to avoid infinite NaNs! ---\n")
+                try:
+                    latest_ckpt.unlink()
+                except Exception as e:
+                    print(f"Error unlinking corrupted checkpoint: {e}")
+            else:
+                # Load weights into the unwrapped model on Rank 0 CPU
+                model.load_state_dict(payload["model"])
+                start_step = payload["training"]["step"]
+                tokens_seen = payload["training"].get("tokens", 0)
+                print(f"Successfully loaded weights into unwrapped model on CPU. Ready for distributed wrapping!")
+
+    if world_size > 1:
+        # Broadcast metadata so all ranks agree on start_step, tokens_seen, and has_nan status
+        metadata = [checkpoint_exists, start_step, tokens_seen, has_nan]
+        dist.broadcast_object_list(metadata, src=0)
+        checkpoint_exists, start_step, tokens_seen, has_nan = metadata
+
     is_fsdp = False
     if world_size > 1:
         if args.fsdp and device.type == "cuda":
@@ -122,7 +166,8 @@ def train(args: argparse.Namespace) -> None:
                 model,
                 device_id=local_rank,
                 mixed_precision=mp_policy,
-                auto_wrap_policy=my_auto_wrap_policy
+                auto_wrap_policy=my_auto_wrap_policy,
+                sync_module_states=True
             )
             is_fsdp = True
             if is_master:
@@ -159,6 +204,13 @@ def train(args: argparse.Namespace) -> None:
         return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = LambdaLR(optimizer, lr_lambda)
 
+    # Step the scheduler to match the restored step count
+    if checkpoint_exists and not has_nan:
+        for _ in range(start_step):
+            scheduler.step()
+        if is_master:
+            print(f"Resumed scheduler state to step {start_step}")
+
 
     if is_fsdp:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
@@ -175,59 +227,10 @@ def train(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"Warning: Could not load default gpt2 tokenizer: {e}")
 
-    # 4. Implement Automatic Checkpoint Resume System (FSDP compatible)
-    start_step = 0
-    tokens_seen = 0
-    
-    latest_ckpt = args.checkpoint_dir / "checkpoint_latest.pt"
-    if not latest_ckpt.exists() and args.checkpoint_dir.exists():
-        ckpt_files = sorted(args.checkpoint_dir.glob("checkpoint_step_*.pt"), key=lambda p: int(p.stem.split("_")[-1]))
-        if ckpt_files:
-            latest_ckpt = ckpt_files[-1]
-            
-    if latest_ckpt.exists():
+    # 4. Checkpoint Resume System log status (FSDP handles parameters during wrap initialization)
+    if checkpoint_exists and not has_nan:
         if is_master:
-            print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights! ---")
-        payload = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
-        
-        # Self-healing check: if the loaded weights contain NaNs, reset to step 0 to avoid infinite NaNs
-        has_nan = False
-        if "model" in payload:
-            for k, v in payload["model"].items():
-                if torch.is_tensor(v) and torch.isnan(v).any():
-                    has_nan = True
-                    break
-                    
-        if has_nan:
-            if is_master:
-                print("\n--- [WARNING] Found NaN weights in checkpoint! Deleting corrupted checkpoint and resetting training from scratch to avoid infinite NaNs! ---\n")
-                try:
-                    latest_ckpt.unlink()
-                except Exception as e:
-                    print(f"Error unlinking corrupted checkpoint: {e}")
-
-        else:
-            if is_fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict = payload["model"] if is_master else None
-                    state_dict_list = [state_dict]
-                    dist.broadcast_object_list(state_dict_list, src=0)
-                    model.load_state_dict(state_dict_list[0])
-            else:
-                model.load_state_dict(payload["model"])
-                
-            start_step = payload["training"]["step"]
-            tokens_seen = payload["training"].get("tokens", 0)
-            
-            # Step the scheduler to match the restored step count
-            for _ in range(start_step):
-                scheduler.step()
-                
-            if is_master:
-                print(f"Successfully loaded checkpoint and resumed from step {start_step}!")
+            print(f"Successfully synchronized loaded checkpoint across ranks! Resuming training from step {start_step}.")
 
 
 
