@@ -71,7 +71,7 @@ def train(args: argparse.Namespace) -> None:
         print(f"Distributed training: world_size={world_size}, device={device}")
         print(f"Model: {preset.display_name} ({estimate_cmf_parameters(config, model_type=preset.model_type):,} params)")
 
-    model = build_model(preset.model_type, config).to(device)
+    model = build_model(preset.model_type, config)
     
     is_fsdp = False
     if world_size > 1:
@@ -84,12 +84,16 @@ def train(args: argparse.Namespace) -> None:
                 reduce_dtype=torch.float16,
                 buffer_dtype=torch.float16
             )
+            # Wrap on CPU first. FSDP will automatically shard and move parameters to local_rank GPU
             model = FSDP(model, device_id=local_rank, mixed_precision=mp_policy)
             is_fsdp = True
             if is_master:
                 print("Using Fully Sharded Data Parallel (FSDP) with FP16 Mixed Precision.")
         else:
+            model = model.to(device)
             model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+    else:
+        model = model.to(device)
 
     if args.compile:
         try:
