@@ -137,8 +137,11 @@ def train(args: argparse.Namespace) -> None:
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, args.steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        progress = min(1.0, progress)
+        min_lr_ratio = 0.05
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = LambdaLR(optimizer, lr_lambda)
+
 
     if is_fsdp:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
