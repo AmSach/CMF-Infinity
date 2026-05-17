@@ -45,7 +45,7 @@ def main():
 
     # 3. Parallel Tokenization (Fast Path)
     data_dir = Path("/content/fineweb_edu_2b")
-    target_tokens = 20_000_000_000 # 20B tokens for the 2B model
+    target_tokens = 200_000_000 # 200M tokens is perfect for a 4-hour Colab budget
     
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
         print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer ---")
