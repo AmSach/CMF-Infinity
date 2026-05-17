@@ -49,7 +49,7 @@ def main():
         "--token-cache-dir", str(data_dir),
         "--micro-batch-size", "1",
         "--grad-accum", "32",
-        "--lr", "1e-4",
+        "--lr", "5e-5",
         "--seq-len", "512",
         "--amp",
         "--tf32",
@@ -57,7 +57,8 @@ def main():
         "--fsdp",
         "--log-every", "1",
         "--save-every", "500",
-        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_1.2b_reasoning.package.pt")
+        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_1.2b_reasoning.package.pt"),
+        "--checkpoint-dir", str(ROOT / "records" / "checkpoints" / "cmf_1.2b_steps")
     ])
 
     if tok_proc is not None:
