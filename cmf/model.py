@@ -408,6 +408,15 @@ class DeliberativeContinuousMeaningField(nn.Module):
             else None
         )
 
+        # Define a single deliberative step function for gradient checkpointing
+        def deliberative_step_fn(z_val, tau_val):
+            flat_z = z_val.reshape(batch_size * target_length, -1)
+            velocity = self.field(flat_z, flat_context, tau_val, goal=flat_goal).reshape_as(z_val)
+            proposal = z_val + velocity / float(steps)
+            gate_input = torch.cat([z_val, proposal, context], dim=-1)
+            gate = torch.sigmoid(self.update_gate(gate_input))
+            return z_val + gate * (proposal - z_val)
+
         actual_steps = 0
         for step_idx in range(steps):
             tau_value = (step_idx + 0.5) / float(steps)
@@ -417,12 +426,17 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 dtype=z.dtype,
                 device=z.device,
             )
-            flat_z = z.reshape(batch_size * target_length, -1)
-            velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z)
-            proposal = z + velocity / float(steps)
-            gate_input = torch.cat([z, proposal, context], dim=-1)
-            gate = torch.sigmoid(self.update_gate(gate_input))
-            z = z + gate * (proposal - z)
+            
+            if gradient_checkpointing:
+                z = torch.utils.checkpoint.checkpoint(
+                    deliberative_step_fn,
+                    z,
+                    tau,
+                    use_reentrant=False
+                )
+            else:
+                z = deliberative_step_fn(z, tau)
+
             halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z)))
             halt_means.append(halt_prob.mean())
             actual_steps = step_idx + 1
