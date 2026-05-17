@@ -287,7 +287,23 @@ def train(args: argparse.Namespace) -> None:
             total_tokens = tokens_seen * world_size
             current_lr = scheduler.get_last_lr()[0]
             avg_loss = step_loss / args.grad_accum
-            print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f}")
+            
+            # Calculate highly precise ETA for the entire epoch
+            steps_done_this_run = step + 1 - start_step
+            seconds_per_step = elapsed / max(1, steps_done_this_run)
+            steps_remaining = args.steps - (step + 1)
+            seconds_remaining = steps_remaining * seconds_per_step
+            
+            if seconds_remaining < 60:
+                eta_str = f"{seconds_remaining:.0f}s"
+            elif seconds_remaining < 3600:
+                eta_str = f"{seconds_remaining/60:.1f}m"
+            else:
+                hours = int(seconds_remaining // 3600)
+                minutes = int((seconds_remaining % 3600) // 60)
+                eta_str = f"{hours}h {minutes}m"
+                
+            print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f} eta={eta_str}")
 
 
         # Save latest checkpoint at each training step asynchronously (overwrites previous to save disk space with ZERO I/O delay)
