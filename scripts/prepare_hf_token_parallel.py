@@ -45,6 +45,18 @@ def main():
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check for existing shards to resume
+    existing_shards = sorted(args.output_dir.glob("tokens_*.pt"))
+    tokens_saved = 0
+    if existing_shards:
+        for shard_file in existing_shards:
+            try:
+                payload = torch.load(shard_file, map_location="cpu")
+                tokens_saved += payload["tokens"].numel()
+            except Exception as e:
+                print(f"Warning: Failed to load existing shard {shard_file}: {e}")
+        print(f"\n--- [RESUME] Found {len(existing_shards)} existing shards on disk ({tokens_saved:,} tokens). Fast-forwarding generator... ---\n")
+
     tokens_seen = 0
     shard_idx = 0
     shard_tokens = []
@@ -74,6 +86,9 @@ def main():
         return tensor.numel()
 
     shard_token_count = 0
+    skipped_tokens = 0
+    skipping_mode = (tokens_saved > 0)
+    
     for row in dataset:
         current_batch.append(row[args.text_column])
         
@@ -83,8 +98,19 @@ def main():
             for ids in tokenized:
                 if args.append_eos:
                     ids.append(tokenizer.eos_token_id)
-                shard_tokens.append(ids)
+                
                 count = len(ids)
+                if skipping_mode:
+                    skipped_tokens += count
+                    if skipped_tokens >= tokens_saved:
+                        skipping_mode = False
+                        # Set initial stats to match what is on disk
+                        tokens_seen = tokens_saved
+                        shard_idx = len(existing_shards)
+                        print(f"\n--- [RESUME COMPLETE] Fast-forwarded past {tokens_saved:,} tokens. Resuming tokenization at Shard {shard_idx}! ---\n")
+                    continue
+                
+                shard_tokens.append(ids)
                 shard_token_count += count
                 tokens_seen += count
                 
@@ -96,28 +122,33 @@ def main():
                     shard_token_count = 0
             
             # Print real-time progress update
-            elapsed = time.perf_counter() - start_time
-            tok_s = tokens_seen / max(elapsed, 1e-6)
-            percentage = (tokens_seen / args.target_tokens) * 100.0
-            
-            # Estimate ETA
-            remaining_tokens = max(0, args.target_tokens - tokens_seen)
-            eta_seconds = remaining_tokens / max(tok_s, 1e-6)
-            
-            if eta_seconds > 3600:
-                eta_str = f"{eta_seconds / 3600:.2f} hrs"
-            elif eta_seconds > 60:
-                eta_str = f"{eta_seconds / 60:.2f} mins"
-            else:
-                eta_str = f"{eta_seconds:.0f} secs"
+            if not skipping_mode:
+                elapsed = time.perf_counter() - start_time
+                tok_s = (tokens_seen - tokens_saved) / max(elapsed, 1e-6)
+                percentage = (tokens_seen / args.target_tokens) * 100.0
                 
-            print(f"[Progress] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
-                  f"Shard {shard_idx} progress: {shard_token_count:,}/{args.shard_tokens:,} | "
-                  f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
+                # Estimate ETA
+                remaining_tokens = max(0, args.target_tokens - tokens_seen)
+                eta_seconds = remaining_tokens / max(tok_s, 1e-6)
+                
+                if eta_seconds > 3600:
+                    eta_str = f"{eta_seconds / 3600:.2f} hrs"
+                elif eta_seconds > 60:
+                    eta_str = f"{eta_seconds / 60:.2f} mins"
+                else:
+                    eta_str = f"{eta_seconds:.0f} secs"
+                    
+                print(f"[Progress] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
+                      f"Shard {shard_idx} progress: {shard_token_count:,}/{args.shard_tokens:,} | "
+                      f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
+            else:
+                pct = (skipped_tokens / tokens_saved) * 100.0 if tokens_saved > 0 else 0.0
+                print(f"[Fast-Forward] Skipping already processed data... {skipped_tokens:,} / {tokens_saved:,} tokens skipped ({pct:.1f}%)", end="\r", flush=True)
             
             current_batch = []
             if tokens_seen >= args.target_tokens:
                 break
+
                 
     if shard_tokens:
         save_shard(shard_tokens, shard_idx)
