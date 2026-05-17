@@ -75,7 +75,7 @@ def main():
         "--compile",
         "--fsdp",
         "--log-every", "1",
-        "--save-every", "500",
+        "--save-every", "5",
         "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_120m_reasoning.package.pt"),
         "--checkpoint-dir", str(ROOT / "records" / "checkpoints" / "cmf_120m_steps")
     ])
