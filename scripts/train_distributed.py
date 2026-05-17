@@ -143,7 +143,7 @@ def train(args: argparse.Namespace) -> None:
     if world_size > 1:
         if args.fsdp and device.type == "cuda":
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import MixedPrecision
+            from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
             
             from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
             import functools
@@ -167,6 +167,7 @@ def train(args: argparse.Namespace) -> None:
                 device_id=local_rank,
                 mixed_precision=mp_policy,
                 auto_wrap_policy=my_auto_wrap_policy,
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
                 sync_module_states=True
             )
             is_fsdp = True
