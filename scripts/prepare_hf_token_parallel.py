@@ -52,7 +52,7 @@ def main():
     start_time = time.perf_counter()
     
     # We'll pull in batches and tokenize them
-    batch_size = 5000
+    batch_size = 1000
     current_batch = []
     
     print(f"Starting parallel tokenization with {args.num_proc} processes...")

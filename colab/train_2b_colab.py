@@ -48,7 +48,7 @@ def main():
             f"--dataset HuggingFaceTB/smollm-corpus "
             f"--dataset-name fineweb-edu-dedup "
             f"--target-tokens {target_tokens} "
-            f"--shard-tokens 200000000 "
+            f"--shard-tokens 25000000 "
             f"--output-dir {str(data_dir)} "
             f"--append-eos")
 
