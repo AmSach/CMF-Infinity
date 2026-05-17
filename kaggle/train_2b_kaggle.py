@@ -21,8 +21,19 @@ def main():
     target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
     
     if not data_dir.exists() or not (data_dir / "manifest.json").exists():
-        print(f"--- Preparing {target_tokens:,} tokens using Parallel Tokenizer (BACKGROUND PROCESS) ---")
-        # Launch tokenization as a background process so training can start concurrently
+        # Count existing shards to reassure the user
+        existing_shards = sorted(data_dir.glob("tokens_*.pt")) if data_dir.exists() else []
+        if existing_shards:
+            print(f"\n--- [INFO] Found {len(existing_shards)} existing token shards already on disk! ---")
+            print(f"--- The tokenizer will resume downloading and parsing starting at Shard {len(existing_shards)} ---\n")
+        else:
+            print(f"\n--- Preparing {target_tokens:,} tokens using Parallel Tokenizer (BACKGROUND PROCESS) ---\n")
+        
+        # Launch tokenization as a background process redirecting stdout/stderr to a dedicated log file
+        log_file = ROOT / "records" / "tokenizer_output.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(log_file, "w", encoding="utf-8")
+        
         tok_proc = subprocess.Popen([
             sys.executable, str(ROOT / "scripts" / "prepare_hf_token_parallel.py"),
             "--dataset", "HuggingFaceTB/smollm-corpus",
@@ -31,10 +42,15 @@ def main():
             "--shard-tokens", "25000000",
             "--output-dir", str(data_dir),
             "--append-eos"
-        ])
-        print("--- Parallel Tokenizer launched in background. ---")
+        ], stdout=log_handle, stderr=subprocess.STDOUT)
+        
+        print(f"--- Parallel Tokenizer launched in background. ---")
+        print(f"--- All downloader/tokenizer output is logged to: {log_file} ---")
+        print("--- You can view the live download/tokenizer progress anytime by running: !tail -n 20 /kaggle/working/records/tokenizer_output.log ---\n")
     else:
+        print("\n--- [INFO] Full dataset tokenization manifest already exists. Skipping downloader. ---\n")
         tok_proc = None
+
 
     # 3. Start Deep 1.2B Reasoning Training
     print("--- Starting Deep 1.2B Reasoning Training (2x T4) ---")
