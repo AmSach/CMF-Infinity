@@ -154,7 +154,8 @@ def train(args: argparse.Namespace) -> None:
                         cleaned_state_dict[k] = v
                 model.load_state_dict(cleaned_state_dict)
                 start_step = payload["training"]["step"]
-                tokens_seen = payload["training"].get("tokens", 0)
+                # Mathematically calculate exact tokens seen by a single rank up to this step to prevent exponential multiplication bug
+                tokens_seen = start_step * args.micro_batch_size * args.grad_accum * config.max_seq_len
                 print(f"Successfully loaded weights into unwrapped model on CPU (cleaned _orig_mod prefix). Ready for distributed wrapping!")
 
     if world_size > 1:
