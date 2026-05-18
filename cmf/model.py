@@ -536,10 +536,20 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     device=z.device,
                 )
                 
+                # Dynamic Gravitational Retrieval of sharp context details (Parameter-Free & zero KV-Cache VRAM death!)
+                if context.size(1) > 1:
+                    past_contexts = context[:, :-1]
+                    sim = torch.matmul(z.unsqueeze(1), past_contexts.transpose(-1, -2)).squeeze(1) / math.sqrt(z.size(-1))
+                    weights = torch.softmax(sim, dim=-1)
+                    c_sharp = torch.matmul(weights.unsqueeze(1), past_contexts).squeeze(1)
+                    c_effective = c_last + 0.15 * c_sharp
+                else:
+                    c_effective = c_last
+                
                 # Dynamic field velocity
-                velocity = self.field(z, c_last, tau, goal=flat_goal)
+                velocity = self.field(z, c_effective, tau, goal=flat_goal)
                 proposal = z + velocity / float(steps)
-                gate_input = torch.cat([z, proposal, c_last], dim=-1)
+                gate_input = torch.cat([z, proposal, c_effective], dim=-1)
                 gate = torch.sigmoid(self.update_gate(gate_input))
                 
                 # Calculate change magnitude (velocity)
@@ -581,8 +591,6 @@ class DeliberativeContinuousMeaningField(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
             
         return generated
-
-
 class FastParallelContinuousMeaningField(nn.Module):
     """Lightweight vectorized CMF for efficiency experiments.
 
