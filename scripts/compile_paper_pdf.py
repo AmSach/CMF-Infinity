@@ -152,33 +152,91 @@ def preprocess_math(text: str) -> str:
     def clean_latex(latex: str) -> str:
         html = latex
         
-        # Standard replacements
+        # Clean up known LaTeX formatting environments
+        html = html.replace(r"\begin{aligned}", "")
+        html = html.replace(r"\end{aligned}", "")
+        html = html.replace(r"\begin{cases}", "{<br>TABPLACEHOLDER")
+        html = html.replace(r"\end{cases}", "<br>}")
+        
+        # Replace line breaks and alignment tabs inside math blocks
+        html = html.replace(r"\\", "<br>TABPLACEHOLDER")
+        html = html.replace("&", "ALIGNPLACEHOLDER")
+        
+        # Operator and symbol replacements
         html = html.replace(r"\mathbb{R}", "ℝ")
-        html = html.replace(r"\in", "&isin;")
+        html = html.replace(r"\in", " ∈ ")
         html = html.replace(r"\dots", "…")
-        html = html.replace(r"\cdot", "&middot;")
-        html = html.replace(r"\times", "&times;")
-        html = html.replace(r"\theta", "&theta;")
-        html = html.replace(r"\tau", "&tau;")
-        html = html.replace(r"\epsilon", "&epsilon;")
-        html = html.replace(r"\sigma", "&sigma;")
-        html = html.replace(r"\beta", "&beta;")
-        html = html.replace(r"\sum", "&sum;")
+        html = html.replace(r"\cdot", " · ")
+        html = html.replace(r"\times", " × ")
+        html = html.replace(r"\sum", " ∑ ")
+        html = html.replace(r"\|\|", "||")
         html = html.replace(r"\|", "|")
-        html = html.replace(r"\leftarrow", "&larr;")
-        html = html.replace(r"\rightarrow", "&rarr;")
-        html = html.replace(r"\implies", "&rArr;")
+        html = html.replace(r"\leftarrow", " ← ")
+        html = html.replace(r"\rightarrow", " → ")
+        html = html.replace(r"\implies", " ⇒ ")
         html = html.replace(r"\sim", "~")
         html = html.replace(r"\mathcal{N}", "𝒩")
         html = html.replace(r"\sin", "sin")
+        html = html.replace(r"\cos", "cos")
+        html = html.replace(r"\tanh", "tanh")
+        html = html.replace(r"\log", "log")
+        html = html.replace(r"\ln", "ln")
+        html = html.replace(r"\exp", "exp")
+        html = html.replace(r"\partial", "∂")
+        html = html.replace(r"\nabla", "∇")
         html = html.replace(r"\left", "")
         html = html.replace(r"\right", "")
+        html = html.replace(r"\le", " ≤ ")
+        html = html.replace(r"\ge", " ≥ ")
+        html = html.replace(r"\approx", " ≈ ")
+        html = html.replace(r"\odot", " ⊙ ")
+        html = html.replace(r"\int", "∫")
+        html = html.replace(r"\displaystyle", "")
+        html = html.replace(r"\infty", "∞")
+        
+        # Greek lowercase
+        html = html.replace(r"\alpha", "α")
+        html = html.replace(r"\beta", "β")
+        html = html.replace(r"\gamma", "γ")
+        html = html.replace(r"\delta", "δ")
+        html = html.replace(r"\epsilon", "ε")
+        html = html.replace(r"\zeta", "ζ")
+        html = html.replace(r"\eta", "η")
+        html = html.replace(r"\theta", "θ")
+        html = html.replace(r"\iota", "ι")
+        html = html.replace(r"\kappa", "κ")
+        html = html.replace(r"\lambda", "λ")
+        html = html.replace(r"\mu", "μ")
+        html = html.replace(r"\nu", "ν")
+        html = html.replace(r"\xi", "ξ")
+        html = html.replace(r"\pi", "π")
+        html = html.replace(r"\rho", "ρ")
+        html = html.replace(r"\sigma", "σ")
+        html = html.replace(r"\tau", "τ")
+        html = html.replace(r"\upsilon", "υ")
+        html = html.replace(r"\phi", "φ")
+        html = html.replace(r"\chi", "χ")
+        html = html.replace(r"\psi", "ψ")
+        html = html.replace(r"\omega", "ω")
+        
+        # Greek uppercase
+        html = html.replace(r"\Alpha", "Α")
+        html = html.replace(r"\Beta", "Β")
+        html = html.replace(r"\Gamma", "Γ")
+        html = html.replace(r"\Delta", "Δ")
+        html = html.replace(r"\Sigma", "Σ")
+        html = html.replace(r"\Phi", "Φ")
+        html = html.replace(r"\Omega", "Ω")
         
         # Parse LaTeX elements using curly brace matching
         html = parse_bf_and_text(html)
         html = parse_sqrts(html)
         html = parse_fractions(html)
         html = parse_sub_superscripts(html)
+        
+        # Resolve temporary placeholders to HTML spaces at the very end
+        html = html.replace("TABPLACEHOLDER", "&nbsp;&nbsp;&nbsp;&nbsp;")
+        html = html.replace("ALIGNPLACEHOLDER", "&nbsp;&nbsp;&nbsp;&nbsp;")
         
         return html
 
@@ -395,20 +453,22 @@ def compile_paper():
         padding: 0px 2px;
     }
     
-    /* Code blocks use simple thin solid border, no colored background */
+    /* Code blocks use simple thin solid border, no colored background, reduced font size to prevent A4 paper overflow */
     pre {
         color: #000000 !important;
         border: 1px solid #000000 !important;
-        padding: 12px;
+        padding: 10px;
         border-radius: 0px !important;
         overflow-x: auto;
         margin-top: 1em;
         margin-bottom: 1.5em;
+        font-size: 7.5pt !important;
     }
     
     pre code {
         color: #000000 !important;
-        font-size: 8pt;
+        font-size: 7.5pt !important;
+        font-family: 'Fira Code', monospace;
     }
     
     /* Blockquotes use classic black left line with zero background color */
