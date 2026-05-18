@@ -509,6 +509,8 @@ class DeliberativeContinuousMeaningField(nn.Module):
         top_k: Optional[int] = None,
         use_velocity_halting: bool = True,
         velocity_epsilon: float = 0.005,
+        stochastic_langevin: bool = True,
+        langevin_noise_scale: float = 1e-4,
     ) -> torch.Tensor:
         self.eval()
         generated = input_ids
@@ -543,6 +545,14 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 # Calculate change magnitude (velocity)
                 delta_z = gate * (proposal - z)
                 z_next = z + delta_z
+                
+                # Algorithmic Cures for Continuous Sinks & Trajectory Crossings
+                if stochastic_langevin and temperature > 0.0:
+                    # Langevin thermal noise to escape entropy sinks
+                    noise = torch.randn_like(z_next) * langevin_noise_scale * temperature
+                    # High-frequency deterministic jitter to resolve trajectory crossings
+                    jitter = torch.sin(z_next * 1000.0) * 1e-6
+                    z_next = z_next + noise + jitter
                 
                 if use_velocity_halting:
                     # L2 norm over model dimension
