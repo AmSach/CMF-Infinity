@@ -230,8 +230,6 @@ def cached_lm_batches_from_shards(
         q.put(None, block=True) # Sentinel to signal end of stream
 
     while num_batches is None or produced < num_batches:
-        if dist.is_initialized():
-            dist.barrier()
         shards = list_token_cache_shards(path)
         # If delete_consumed is active, do not shuffle shards to maintain lockstep order across ranks
         if random_batches and len(shards) > 1 and not delete_consumed:
@@ -277,8 +275,6 @@ def cached_lm_batches_from_shards(
                 
                 # Delete consumed shard files to preserve strict disk limits
                 if delete_consumed:
-                    if dist.is_initialized():
-                        dist.barrier()
                     if rank == 0:
                         try:
                             p = Path(shard_path)
@@ -308,8 +304,6 @@ def cached_lm_batches_from_shards(
             
             # Delete consumed shard files to preserve strict disk limits (sequential path)
             if delete_consumed:
-                if dist.is_initialized():
-                    dist.barrier()
                 if rank == 0:
                     try:
                         p = Path(shard_path)
