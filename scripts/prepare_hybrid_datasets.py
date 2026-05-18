@@ -241,7 +241,7 @@ def main():
                 
             print(f"[Asynchronous Mixer] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
                   f"Shard {shard_idx}: {shard_token_count:,}/{args.shard_tokens:,} | "
-                  f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
+                  f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str} | Queues ({queue_stats})", end="\r", flush=True)
 
     if shard_tokens and tokens_seen < args.target_tokens:
         save_shard(shard_tokens, shard_idx)
