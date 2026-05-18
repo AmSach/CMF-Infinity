@@ -18,7 +18,8 @@ def main():
 
     # 2. Parallel Tokenization (Fast Path)
     data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_cache"
-    target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
+    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_cache"
+    target_tokens = 200_000_000_000 # 200 Billion tokens for absolute hyper-saturation of the 120M model weights
     
     # Kill any zombie tokenizer processes from aborted runs to prevent file locks/contention
     try:
@@ -55,8 +56,8 @@ def main():
     else:
         print("\n--- [INFO] Full dataset tokenization manifest already exists. Skipping downloader. ---\n")
         tok_proc = None
-
-
+ 
+ 
     # 3. Start High-Speed 120M Reasoning Training (2x T4)
     print("--- Starting High-Speed 120M Reasoning Training (2x T4) ---")
     # For a 120M model, we can increase the micro-batch size to 4
@@ -71,9 +72,9 @@ def main():
         "--micro-batch-size", "16",
         "--grad-accum", "2",
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
-
+ 
         "--seq-len", "512",
-        "--steps", "45776",
+        "--steps", "6103515", # (200,000,000,000 / 32,768) matches the exact 200 Billion token budget!
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
