@@ -41,7 +41,8 @@ def main():
             "--target-tokens", str(target_tokens),
             "--shard-tokens", "25000000",
             "--output-dir", str(data_dir),
-            "--append-eos"
+            "--append-eos",
+            "--max-ahead", "5"
         ], stdout=log_handle, stderr=subprocess.STDOUT)
         
         print(f"--- Parallel Tokenizer launched in background. ---")

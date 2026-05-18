@@ -115,21 +115,38 @@ Current reality on this host:
 - The C++ extension does not build because MSVC, `nvcc`, and `ninja` are unavailable.
 - Python/PyTorch remains the reference path.
 
-## Scaling Path
+## Scaling & Pretraining Path
 
-Large-corpus training should use `scripts/train_large_scale.py`:
+CMF Infinity models leverage a highly optimized distributed pretraining architecture on consumer and multi-GPU cluster hardware (e.g., dual Tesla T4s, RTX 4090s):
 
+### 1. The High-Density Hybrid AGI Mixture
+Rather than training on a single web-scraped dataset, CMF Infinity pretrains on a hyper-dense, mathematically diverse **6-source AGI Mixture Recipe** interleaved round-robin by an asynchronous multithreaded queue mixer:
+- **FineWeb-Edu (35% mix)**: Pristine educational web scrape.
+- **Cosmopedia v2 (25% mix)**: Synthetic textbook and course streams.
+- **Stack-Edu-Dedup (15% mix)**: Deduplicated code repositories.
+- **OpenWebMath (10% mix)**: Structured mathematical LaTeX files.
+- **Proof-Pile-2 (10% mix)**: Scientific and rigorous proofs.
+- **Qwen-Math-CoT (5% mix)**: Chain-of-Thought (think) traces.
+
+### 2. Multi-GPU Distributed Data Parallel (DDP)
+To maximize throughput and avoid PCIe interconnect bottle-necks common to layer-by-layer sharding (FSDP), CMF Infinity utilizes **PyTorch Distributed Data Parallel (DDP)** combined with:
+- **High Tensor-Core Saturation**: Large micro-batch size (`32` sequences of length `512` per GPU).
+- **Asynchronous Background Preloading**: A dedicated background CPU thread inside `cached_lm_batches_from_shards` fetches and loads the next token shard in RAM while the GPUs are actively computing forward/backward passes.
+- **Dynamic Checkpoint Restoring**: Auto-stripping of DDP (`module.`) and compiler (`_orig_mod.`) prefixes enables seamless zero-downtime resuming.
+
+### 3. Execution Commands
+To run the high-speed pretraining with DDP, 200 Billion token budget, and active disk space preservation on Kaggle or a cluster:
 ```powershell
-python scripts\train_large_scale.py --device cuda --tokenizer byte --seq-len 1024 --micro-batch-size 4 --grad-accum 8 --steps 1000
+python kaggle/train_120m_kaggle.py
 ```
 
-For streaming web-scale data:
+## Adaptive Disk Space Protection (Flow Control)
 
-```powershell
-python scripts\train_large_scale.py --device cuda --dataset <hf-dataset-id> --tokenizer gpt2 --seq-len 1024 --amp
-```
+Large-scale training with background tokenization and downloading (using `prepare_hybrid_datasets.py` or `prepare_hf_token_parallel.py`) runs download tasks in parallel with training. To prevent disk overflows when writing massive quantities of `.pt` shards, the downloader pipelines support filesystem-level adaptive flow control:
 
-The script streams text, accumulates gradients, resumes from training checkpoints, and can emit an inference package with config/tokenizer metadata.
+- **Usage**: Pass `--max-ahead <N>` (e.g., `--max-ahead 5`) to the downloader/tokenizer scripts.
+- **Mechanism**: The downloader monitors the output directory for the oldest shard index currently present (`min_active`). If the active tokenization shard index is `max_ahead` shards ahead of `min_active`, the downloader pauses, applying backpressure all the way to the streaming Hugging Face queues.
+- **Dynamic Cleanup**: Combined with `--delete-consumed-shards` on the trainer, consumed shards are dynamically deleted from disk, automatically releasing the downloader's pause block and maintaining a tightly bounded local disk footprint.
 
 ## Evaluation Rule
 

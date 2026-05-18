@@ -10,7 +10,95 @@ def run(cmd):
     print(f"Executing: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
+def cleanup_disk_space():
+    print("\n--- [Space Saver Auto-Pilot] Scanning for redundant files to free up disk space... ---")
+    
+    # 1. Clean up old runs directory
+    runs_dir = ROOT / "records" / "runs"
+    if runs_dir.exists():
+        freed = 0
+        deleted_dirs = 0
+        for item in runs_dir.iterdir():
+            if item.is_dir():
+                size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                try:
+                    import shutil
+                    shutil.rmtree(item)
+                    freed += size
+                    deleted_dirs += 1
+                except Exception as e:
+                    print(f"Warning: Failed to delete old run dir {item.name}: {e}")
+        if deleted_dirs > 0:
+            print(f"Successfully cleaned up {deleted_dirs} obsolete run directories, freeing {freed / (1024*1024*1024):.2f} GB!")
+            
+    # 1.5 Migrate previous checkpoints if they exist to the root directory
+    old_nested = ROOT / "records" / "checkpoints" / "cmf_120m_steps" / "checkpoint_latest.pt"
+    old_flat = ROOT / "records" / "checkpoints" / "checkpoint_latest.pt"
+    new_root_ckpt = ROOT / "checkpoint_latest.pt"
+    
+    if old_nested.exists() and not new_root_ckpt.exists():
+        try:
+            import shutil
+            shutil.move(str(old_nested), str(new_root_ckpt))
+            print(f"\n--- [Migration] Successfully migrated nested checkpoint to root: {new_root_ckpt} ---\n")
+        except Exception as migration_err:
+            print(f"Warning: Failed to migrate nested checkpoint: {migration_err}")
+            
+    if old_flat.exists() and not new_root_ckpt.exists():
+        try:
+            import shutil
+            shutil.move(str(old_flat), str(new_root_ckpt))
+            print(f"\n--- [Migration] Successfully migrated flat checkpoint to root: {new_root_ckpt} ---\n")
+        except Exception as migration_err:
+            print(f"Warning: Failed to migrate flat checkpoint: {migration_err}")
+
+    # 2. Clean up redundant checkpoints in records/checkpoints
+    ckpt_dir = ROOT / "records" / "checkpoints"
+    if ckpt_dir.exists():
+        freed = 0
+        deleted_files = 0
+        # Preserve: the active latest checkpoint file, active steps directory, and the final target package
+        preserve_names = {"checkpoint_latest.pt", "cmf_120m_steps", "cmf_120m_reasoning.package.pt"}
+        for item in ckpt_dir.iterdir():
+            if item.name in preserve_names:
+                continue
+            if item.is_file() and item.suffix in {".pt", ".package.pt"}:
+                size = item.stat().st_size
+                try:
+                    item.unlink()
+                    freed += size
+                    deleted_files += 1
+                except Exception as e:
+                    print(f"Warning: Failed to delete redundant checkpoint {item.name}: {e}")
+        if deleted_files > 0:
+            print(f"Successfully deleted {deleted_files} redundant checkpoints, freeing {freed / (1024*1024*1024):.2f} GB!")
+
+    # 3. Clean up obsolete datasets in records/data
+    data_dir_root = ROOT / "records" / "data"
+    if data_dir_root.exists():
+        freed = 0
+        deleted_dirs = 0
+        # Preserve: only the active dataset cache folder used by Kaggle pretraining
+        preserve_names = {"cmf_hybrid_agi_cache"}
+        for item in data_dir_root.iterdir():
+            if item.is_dir() and item.name not in preserve_names:
+                size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                try:
+                    import shutil
+                    shutil.rmtree(item)
+                    freed += size
+                    deleted_dirs += 1
+                except Exception as e:
+                    print(f"Warning: Failed to delete old dataset dir {item.name}: {e}")
+        if deleted_dirs > 0:
+            print(f"Successfully cleaned up {deleted_dirs} obsolete dataset directories, freeing {freed / (1024*1024*1024):.2f} GB!")
+
+    print("--- [Space Saver Auto-Pilot] Scan complete. Output storage is optimized. ---\n")
+
 def main():
+    # 0. Clean up space first to prevent disk full issues
+    cleanup_disk_space()
+
     # 1. Install dependencies
     print("--- Installing dependencies ---")
     run([sys.executable, "-m", "pip", "install", "-e", f"{str(ROOT)}[scale,vision,power]"])
@@ -47,7 +135,8 @@ def main():
             "--target-tokens", str(target_tokens),
             "--shard-tokens", "25000000",
             "--output-dir", str(data_dir),
-            "--append-eos"
+            "--append-eos",
+            "--max-ahead", "5"
         ], stdout=log_handle, stderr=subprocess.STDOUT)
         
         print(f"--- Parallel Interleaved Mixer launched in background. ---")
@@ -72,18 +161,21 @@ def main():
         "--micro-batch-size", "32",
         "--grad-accum", "2",
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
+        "--warmup-steps", "1000", # Fast warmup for 1k steps to allow maximum decay time
+        "--min-lr-ratio", "0.05",
+        "--empty-cache-every", "100",
  
         "--seq-len", "512",
-        "--steps", "3051757", # (200,000,000,000 / 65,536) matches the exact 200 Billion token budget!
+        "--steps", "15000", # Complete cosine decay exactly at step 15,000 for ultimate quality
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
         "--compile",
         "--delete-consumed-shards",
         "--log-every", "1",
-        "--save-every", "10",
-        "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_120m_reasoning.package.pt"),
-        "--checkpoint-dir", str(ROOT / "records" / "checkpoints" / "cmf_120m_steps")
+        "--save-every", "5",
+        "--package-out", str(ROOT / "cmf_120m_reasoning.package.pt"),
+        "--checkpoint-dir", str(ROOT)
     ])
 
     if tok_proc is not None:

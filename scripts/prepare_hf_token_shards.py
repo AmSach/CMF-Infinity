@@ -89,6 +89,7 @@ def main() -> None:
     parser.add_argument("--tokenize-batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--max-ahead", type=int, default=0, help="Limit tokenization to at most N shards ahead of currently training shard to save disk space (0 or negative to disable)")
     args = parser.parse_args()
 
     if args.target_tokens < 1:
@@ -248,6 +249,25 @@ def main() -> None:
             pending_texts.append(text)
             pending_rows.append(row_idx)
             if len(pending_texts) >= args.tokenize_batch_size:
+                # Adaptive Disk Throttle:
+                # Check if the tokenizer is too far ahead of the trainer.
+                if args.max_ahead > 0:
+                    while True:
+                        existing_shards = sorted(args.output_dir.glob("tokens_*.pt"))
+                        if existing_shards:
+                            indices = []
+                            for p in existing_shards:
+                                parts = p.stem.split("_")
+                                if len(parts) >= 2 and parts[-1].isdigit():
+                                    indices.append(int(parts[-1]))
+                            if indices:
+                                min_active = min(indices)
+                                if shard_idx - min_active >= args.max_ahead:
+                                    print(f"[Adaptive Throttle] Shard {shard_idx} is {shard_idx - min_active} shards ahead of training (min active: {min_active}). Pausing downloader to save disk space...", end="\r", flush=True)
+                                    time.sleep(2)
+                                    continue
+                        break
+
                 flush_pending()
             if rows_seen and rows_seen % args.log_every_rows == 0:
                 elapsed = time.perf_counter() - start

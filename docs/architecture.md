@@ -48,15 +48,38 @@ v = F_theta(z, c, tau)
 
 The output `v` is a direction in semantic space.
 
-### ODE Solver
+### ODE/SDE Solver
 
-The solver advances the latent state:
+The solver advances the latent state dynamically from time $t=0$ to $t=1$. To prevent entropy sinks (fixed-point traps causing repetition) and semantic trajectory crossings, CMF uses a **Stochastic Differential Equation (SDE)** solver with high-frequency spatial jitter:
 
+- **Langevin Diffusion**: We inject controlled thermal noise into the state integration:
+  ```text
+  dz = F_theta(z, c, tau) * dt + sigma_noise * Temp * dW
+  ```
+  where `dW` represents standard Brownian motion and `sigma_noise` (default `1e-4`) provides a spatial escape trajectory from local traps.
+- **Topological Spatial Hull Jitter**: High-frequency spatial jitter acts as a spatial wedge to resolve trajectory crossings under floating-point precision constraints ($BF16/FP16$):
+  ```text
+  z = z + sin(z * 1000.0) * 1e-6
+  ```
+
+### Kinetic Energy Coupled Halting
+
+Instead of relying on a separate neural halt head, CMF Couples solver halting directly to the **Kinetic Energy (L2 Norm of Velocity)** of the flowing latent state. If the semantic velocity falls below a threshold:
 ```text
-z_next = z + dt * v
+||v(t)||_2 < epsilon (default 0.005)
 ```
+The integration loop is aborted early, saving VRAM and computational cycles on easily processed tokens.
 
-The reference implementation uses PyTorch. The extension scaffold provides a C++/CUDA path for integrating precomputed velocity tensors.
+### Celestial Gravity Beacons (Parameter-Free Memory)
+
+To bypass the memory-heavy multi-layer KV-Cache scaling bottleneck ($O(L^2)$), CMF deploys visited states as passive **Celestial Gravity Beacons** in coordinate space. 
+
+- **Retrieval Mechanism**: During latent flow, the active state `z` acts as a query to retrieve historical context `c_sharp`:
+  ```text
+  scores = softmax(z @ C_past.T / sqrt(d_model))
+  c_sharp = scores @ C_past
+  ```
+- **Trajectory Bending**: The retrieved context `c_sharp` dynamically bends the semantic velocity field `F_theta(z, c_effective, tau)` toward target facts without the memory footprint of attention.
 
 ### Decoder
 

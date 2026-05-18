@@ -4,6 +4,12 @@ import argparse
 import json
 import os
 import sys
+import warnings
+warnings.filterwarnings("ignore")
+import logging
+logging.getLogger("torch").setLevel(logging.ERROR)
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "OFF"
 import time
 import math
 from pathlib import Path
@@ -225,12 +231,12 @@ def train(args: argparse.Namespace) -> None:
     # 2. Add Cosine Warmup Learning Rate Scheduler for ultimate stability
     from torch.optim.lr_scheduler import LambdaLR
     def lr_lambda(current_step: int):
-        warmup_steps = 100
+        warmup_steps = args.warmup_steps
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, args.steps - warmup_steps))
         progress = min(1.0, progress)
-        min_lr_ratio = 0.05
+        min_lr_ratio = args.min_lr_ratio
         return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = LambdaLR(optimizer, lr_lambda)
 
@@ -312,6 +318,10 @@ def train(args: argparse.Namespace) -> None:
         scaler.update()
         scheduler.step()
 
+        # OOM prevention: periodically empty CUDA cache to prevent VRAM fragmentation
+        if device.type == "cuda" and args.empty_cache_every > 0 and (step + 1) % args.empty_cache_every == 0:
+            torch.cuda.empty_cache()
+
         if is_master and (step + 1) % args.log_every == 0:
             elapsed = time.perf_counter() - start_time
             total_tokens = tokens_seen * world_size
@@ -381,6 +391,15 @@ def train(args: argparse.Namespace) -> None:
                                 if tmp.exists():
                                     tmp.replace(final)
                                 print(f"Successfully saved latest checkpoint in background for step {step_num}")
+                                # Replicate to a safe, static directory only every 50 steps on Kaggle
+                                if step_num % 50 == 0:
+                                    try:
+                                        safe_final = ROOT / "checkpoint_stable.pt"
+                                        import shutil
+                                        shutil.copy2(final, safe_final)
+                                        print(f"Successfully replicated to stable copy at step {step_num}: {safe_final}")
+                                    except Exception as copy_err:
+                                        print(f"Warning: Failed to replicate checkpoint to safe directory: {copy_err}")
                             except Exception as e:
                                 print(f"Error in background checkpoint save: {e}")
                                 
@@ -407,6 +426,15 @@ def train(args: argparse.Namespace) -> None:
                                 if tmp.exists():
                                     tmp.replace(final)
                                 print(f"Successfully saved latest checkpoint in background for step {step_num}")
+                                # Replicate to a safe, static directory only every 50 steps on Kaggle
+                                if step_num % 50 == 0:
+                                    try:
+                                        safe_final = ROOT / "checkpoint_stable.pt"
+                                        import shutil
+                                        shutil.copy2(final, safe_final)
+                                        print(f"Successfully replicated to stable copy at step {step_num}: {safe_final}")
+                                    except Exception as copy_err:
+                                        print(f"Warning: Failed to replicate checkpoint to safe directory: {copy_err}")
                             except Exception as e:
                                 print(f"Error in background checkpoint save: {e}")
                                 
@@ -465,6 +493,9 @@ def main():
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--fsdp", action="store_true", help="Enable Fully Sharded Data Parallel (FSDP)")
     parser.add_argument("--delete-consumed-shards", action="store_true", help="Delete consumed token cache shards to save disk space")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of learning rate warmup steps")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum learning rate ratio relative to base lr")
+    parser.add_argument("--empty-cache-every", type=int, default=100, help="Empty CUDA cache every N steps to prevent OOM fragmentation")
     parser.add_argument("--package-out", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_final.package.pt")
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_steps")
     args = parser.parse_args()

@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-proc", type=int, default=os.cpu_count())
     parser.add_argument("--append-eos", action="store_true")
+    parser.add_argument("--max-ahead", type=int, default=0, help="Limit tokenization to at most N shards ahead of currently training shard to save disk space (0 or negative to disable)")
     args = parser.parse_args()
 
     print(f"Loading dataset {args.dataset} (streaming=True for instant startup)...")
@@ -81,6 +82,25 @@ def main():
         current_batch.append(row[args.text_column])
         
         if len(current_batch) >= batch_size:
+            # Adaptive Disk Throttle:
+            # Check if the tokenizer is too far ahead of the trainer.
+            if args.max_ahead > 0:
+                while True:
+                    existing_shards = sorted(args.output_dir.glob("tokens_*.pt"))
+                    if existing_shards:
+                        indices = []
+                        for p in existing_shards:
+                            parts = p.stem.split("_")
+                            if len(parts) >= 2 and parts[-1].isdigit():
+                                indices.append(int(parts[-1]))
+                        if indices:
+                            min_active = min(indices)
+                            if shard_idx - min_active >= args.max_ahead:
+                                print(f"[Adaptive Throttle] Shard {shard_idx} is {shard_idx - min_active} shards ahead of training (min active: {min_active}). Pausing downloader to save disk space...", end="\r", flush=True)
+                                time.sleep(2)
+                                continue
+                    break
+
             # Tokenize batch in parallel via HF Tokenizer Rust multi-threading
             tokenized = tokenizer(current_batch, add_special_tokens=False)["input_ids"]
             

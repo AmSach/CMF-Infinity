@@ -27,6 +27,13 @@ Examples:
 - The adaptive solver now selects a bounded step count first, then integrates over exactly one latent-time interval.
 - A 120M-class preset and gate exist: `infinity-0.12b` and `scripts/run_120m_gate.py`.
 - A deliberative 120M-class preset exists: `infinity-reasoning-0.12b`, backed by `DeliberativeContinuousMeaningField`.
+- **Langevin SDE Diffusion integration**: Escape thermal noise paths successfully implemented in `cmf/solver.py` to circumvent entropy sinks and infinite output loops.
+- **Topological Spatial Hull Jitter**: High-frequency spatial jitter (`J(z) = sin(z*1000) * 1e-6`) prevents floating-point trajectory crossings and numerical collisions.
+- **Kinetic Energy-coupled Halting**: Solver halting coupled directly to latent velocity L2 norm ($||v||_2 < 0.005$) to dynamically save VRAM and computation.
+- **Celestial Gravity Beacons**: Flat parameter-free coordinate memory implemented to bypass $O(L^2)$ Multi-layer KV-Cache scaling bottlenecks via trajectory bending.
+- **High-speed PyTorch DDP training**: Upgraded pretraining thrusters with standard DistributedDataParallel, double micro-batch size (`32`), and background asynchronous data preloading.
+- **6-source AGI Fuel Mixture**: Fully implemented asynchronous round-robin pretraining mixer loading FineWeb-Edu, Cosmopedia v2, Stack-Edu-Dedup, OpenWebMath, Proof-Pile-2, and Qwen-Math-CoT.
+- **Adaptive Disk Space Protection**: Filesystem flow control implemented with active shard deletion inside DDP training to ensure tight storage boundaries.
 
 ## Latest 120M-Class Gate
 

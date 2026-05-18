@@ -89,6 +89,7 @@ def main():
     parser.add_argument("--shard-tokens", type=int, default=25_000_000)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--append-eos", action="store_true")
+    parser.add_argument("--max-ahead", type=int, default=0, help="Limit tokenization to at most N shards ahead of currently training shard to save disk space (0 or negative to disable)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,8 +112,8 @@ def main():
     queues = {}
     threads = []
     for cfg in DATASET_CONFIGS:
-        # Buffer up to 30,000 texts in RAM per stream to completely absorb internet latency spikes
-        q = queue.Queue(maxsize=30000)
+        # Buffer up to 10,000 texts in RAM per stream to completely absorb internet latency spikes
+        q = queue.Queue(maxsize=10000)
         queues[cfg["name"]] = q
         
         t = threading.Thread(
@@ -123,7 +124,7 @@ def main():
         )
         t.start()
         threads.append(t)
-        print(f"   -> Spawned background pre-fetch thread: {t.name} (Max Queue: 30,000 docs)")
+        print(f"   -> Spawned background pre-fetch thread: {t.name} (Max Queue: 10,000 docs)")
 
     tokens_seen = 0
     shard_idx = 0
@@ -179,11 +180,27 @@ def main():
                     # If empty, move to next queue to prevent stalling the loop
                     break
         
-        if not batch_texts:
-            # Queues momentarily starving; sleep briefly to allow producers to buffer
-            time.sleep(0.05)
             continue
-            
+
+        # Adaptive Disk Throttle:
+        # Check if the tokenizer is too far ahead of the trainer.
+        if args.max_ahead > 0:
+            while True:
+                existing_shards = sorted(args.output_dir.glob("tokens_*.pt"))
+                if existing_shards:
+                    indices = []
+                    for p in existing_shards:
+                        parts = p.stem.split("_")
+                        if len(parts) >= 2 and parts[-1].isdigit():
+                            indices.append(int(parts[-1]))
+                    if indices:
+                        min_active = min(indices)
+                        if shard_idx - min_active >= args.max_ahead:
+                            print(f"[Adaptive Throttle] Shard {shard_idx} is {shard_idx - min_active} shards ahead of training (min active: {min_active}). Pausing downloader to save disk space...", end="\r", flush=True)
+                            time.sleep(2)
+                            continue
+                break
+
         # Re-batch to maximize Rust parallel tokenization throughput
         tokenized = tokenizer(batch_texts, add_special_tokens=False)["input_ids"]
         
