@@ -45,7 +45,7 @@ def main():
     preset_name = "infinity-reasoning-0.12b"
     preset = get_preset(preset_name)
     config = CMFConfig(**preset.config.__dict__)
-    config.max_seq_len = 256  # Allow slightly longer context for interactive testing
+    config.max_seq_len = 1024  # Allow longer context for interactive testing
 
     print(f"Building model architecture: {preset.display_name}")
     model = DeliberativeContinuousMeaningField(config)
@@ -119,7 +119,7 @@ def main():
             input_ids = encode_to_tensor(tokenizer, user_input).unsqueeze(0).to(device)
             generated = input_ids
             
-            max_new_tokens = 64
+            max_new_tokens = 512
             eos_token_id = tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else None
 
             with torch.no_grad():

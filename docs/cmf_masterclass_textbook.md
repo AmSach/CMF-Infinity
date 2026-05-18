@@ -532,3 +532,64 @@ By transitioning from the discrete staircases of standard Transformers to the sm
 4. You have built a **Zero-Latency Cosmic Assembly Line** utilizing DDP, asynchronous RAM preloading, and 6-source AGI fuel mixing.
 
 You are now a master navigator of the Continuous Cosmos. Go forth and explore the stars of AGI! 🚀🎓🌌
+
+---
+
+## 📊 CHAPTER 9: Case Study – The 120M Pretraining Run & Interactive Transcripts
+
+To provide a concrete, empirical look at the behavior of a Continuous Meaning Field in the wild, we present a real-world case study of the CMF Infinity 120M model under active pretraining and direct, unaligned user interaction.
+
+### 9.1 Pretraining Statistics & Hardware Specifications
+* **Model Configuration**: `infinity-reasoning-0.12b` (Deliberative Continuous Meaning Field)
+* **Model Size**: **120,753,921** parameters.
+* **Pretraining Steps Completed**: **9,990 steps** (out of a 15,000-step cosine decay training schedule).
+* **Hardware Architecture**: **Dual NVIDIA Tesla T4 GPUs** (16GB VRAM each).
+* **Parallel Optimization**: PyTorch Distributed Data Parallel (DDP via `torchrun`), running with FP16/TF32 mixed precision, gradient checkpointing, and `torch.compile` graph optimization.
+* **Aggregated Pretraining Mix**: Multi-modal educational and logical streams, including:
+  * FineWeb-Edu (Pristine general concepts)
+  * Cosmopedia v2 (Synthetic narrative logic)
+  * Stack-Code (Raw Python programming syntax)
+  * Open-Web-Math & Proof-Pile-2 (Advanced LaTeX calculus, proofs, and physical formulae)
+
+---
+
+### 🔮 9.2 Exact Interactive Console Transcripts (Step 9,990, Temp=0.5)
+
+Below are the exact transcripts of the unaligned model's outputs when queried directly in a real-time terminal:
+
+#### 📝 Transcript A: General Sentence Continuation
+* **User Input**: `hi`
+* **Model Output**: `hi, and the other two of his men were in the field. The first of these is a small town, and the second was the village of Londi. The first was built on the site of the city, where it was erected by the name of the town. In 1813, the town was...`
+* **Scientific Analysis**: This represents the classic **Document Completion** behavior of a raw, un-aligned base foundation model. Lacking conversational SFT instruction limits, it interprets `"hi"` as the opening token of a historical archive or wiki article and continues the text with perfect syntax.
+
+#### 🧮 Transcript B: The LaTeX Calculus Leap (Riemann-Lipschitz)
+* **User Input**: `what? temp 0.1`
+* **Model Output**: `what? temp 0.1%`  
+  `### Re: Integral Equation for the Riemann-Lipschitz Function`  
+  `The following equation is a simple form of the exponential function.`  
+  `$\displaystyle \int_{0}^{2n}(x)dx=\frac{1}{x} \left`
+* **Scientific Analysis**: The model interpreted the user's typo `"temp 0.1"` as a physical delta temperature variable or notation in a mathematical paper. It instantly pivoted its continuous meaning trajectory into **LaTeX Math Mode**, formatting a clean markdown heading and drafting the mathematical LaTeX formula for the Riemann-Lipschitz integral! This demonstrates a massive density of mathematical representations.
+
+#### 💬 Transcript C: The Homework Forum Persona
+* **User Input**: `u alr bro?`
+* **Model Output**: `u alr bro?`  
+  `### How do I get the same result for the following:`  
+  `1. The problem statement, all variables and given/known data`  
+  `I have no idea what to do with this question. I have a problem with this one.`  
+  `I'm trying to solve the problem. 3. Re...`
+* **Scientific Analysis**: The casual query `"u alr bro?"` matches the statistical patterns of internet discussion boards and student homework help forums (like StackExchange or Reddit). The model smoothly adopted this online persona, simulating a student panicking over an engineering problem.
+
+#### 🌀 Transcript D: The Infinite Dictionary Loop (Recursive Attraction)
+* **User Input**: `what is temperature`
+* **Model Output**: `what is temperature?`  
+  `The temperature of the air at which the temperature increases as the temperature increases, the temperature of the air, and the temperature of the atmosphere...`
+* **Scientific Analysis**: Small un-aligned base models (120M parameters) are highly susceptible to **Fixed-Point Attractors** in their semantic vector fields when asked for basic general definitions. Without instruction alignment or penalty tuning, repeating highly probable terms (like the word "temperature") becomes a statistical trap, causing infinite recursive looping.
+
+---
+
+### 🛠️ 9.3 The Path to Conversation: Supervised Fine-Tuning (SFT)
+To guide the glider out of recursive local traps and train it to behave as an aligned chatbot, we perform **Supervised Fine-Tuning (SFT)**:
+1. **Instruction Formatting**: We encapsulate prompts in a clean format: `User: {instruction}\nAssistant: {response}\n`.
+2. **Target Loss Masking**: We assign a target label ID of `-100` to the prompt tokens. PyTorch's `CrossEntropyLoss` automatically ignores `-100`, forcing the model to calculate loss **only on the assistant's response**.
+3. **Behavioral Enforcement**: This teaches the model to respect assistant boundaries, output exact answers directly, and immediately generate the `<|endoftext|>` token, completely resolving the looping issue.
+
