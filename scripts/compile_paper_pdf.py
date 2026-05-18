@@ -133,59 +133,59 @@ def compile_paper():
     
     body {
         font-family: 'Lora', 'Georgia', serif;
-        color: #1e293b;
-        line-height: 1.5;
+        color: #000000;
+        line-height: 1.6;
         font-size: 10.5pt;
-        margin: 20mm 20mm 20mm 20mm;
+        margin: 25mm 20mm 20mm 20mm;
     }
     
     .paper-header {
         text-align: center;
-        margin-bottom: 25px;
+        margin-bottom: 30px;
     }
     
     .paper-title {
         font-family: 'Inter', sans-serif;
-        font-size: 21pt;
+        font-size: 22pt;
         font-weight: 700;
-        color: #0f172a;
-        margin-top: 15px;
-        margin-bottom: 12px;
+        color: #000000;
+        margin-top: 20px;
+        margin-bottom: 15px;
         line-height: 1.25;
         text-align: center;
     }
     
     .author-block {
-        margin-bottom: 20px;
-        line-height: 1.4;
+        margin-bottom: 25px;
+        line-height: 1.5;
         text-align: center;
     }
     
     .author-name {
         font-family: 'Inter', sans-serif;
-        font-size: 12pt;
+        font-size: 12.5pt;
         font-weight: 600;
-        color: #1e3a8a;
+        color: #000000;
     }
     
     .author-affiliation {
-        font-size: 9.5pt;
-        color: #475569;
+        font-size: 10pt;
+        color: #334155;
         font-style: italic;
     }
     
     .author-email {
-        font-size: 8.5pt;
-        color: #64748b;
+        font-size: 9pt;
+        color: #475569;
     }
     
     .abstract-box {
-        max-width: 90%;
-        margin: 20px auto 25px auto;
-        padding-top: 12px;
-        padding-bottom: 12px;
-        border-top: 1px solid #cbd5e1;
-        border-bottom: 1px solid #cbd5e1;
+        max-width: 85%;
+        margin: 25px auto 30px auto;
+        padding-top: 15px;
+        padding-bottom: 15px;
+        border-top: 1.5px solid #000000;
+        border-bottom: 1.5px solid #000000;
         text-align: justify;
     }
     
@@ -194,70 +194,74 @@ def compile_paper():
         font-size: 10pt;
         font-weight: 700;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 6px;
-        color: #0f172a;
+        letter-spacing: 0.8px;
+        margin-bottom: 8px;
+        color: #000000;
         text-align: center;
     }
     
     .abstract-text {
         font-size: 9.5pt;
-        line-height: 1.45;
-        color: #334155;
+        line-height: 1.5;
+        color: #000000;
         margin: 0;
     }
     
     h2, h3, h4 {
         font-family: 'Inter', sans-serif;
-        color: #0f172a;
-        font-weight: 600;
-        margin-top: 1.8em;
-        margin-bottom: 0.5em;
+        color: #000000;
+        font-weight: 700;
+        margin-top: 2em;
+        margin-bottom: 0.6em;
     }
     
     h2 {
-        font-size: 13pt;
-        border-bottom: 1px solid #e2e8f0;
+        font-size: 13.5pt;
+        border-bottom: 1.5px solid #000000;
         padding-bottom: 4px;
-        color: #1e3a8a;
+        margin-top: 2.2em;
     }
     
     h3 {
-        font-size: 11pt;
-        color: #2563eb;
+        font-size: 11.5pt;
+        border-bottom: 1px solid #cbd5e1;
+        padding-bottom: 2px;
     }
     
     p {
         margin-top: 0;
-        margin-bottom: 1em;
+        margin-bottom: 1.2em;
         text-align: justify;
+        text-justify: inter-word;
     }
     
     .equation {
         text-align: center;
         font-style: italic;
-        margin: 15px 0;
+        margin: 20px 0;
         font-size: 11pt;
         font-family: 'Lora', 'Georgia', serif;
-        color: #0f172a;
+        color: #000000;
     }
     
     code {
         font-family: 'Fira Code', monospace;
         font-size: 8.5pt;
         background-color: #f1f5f9;
-        color: #0f172a;
-        padding: 1.5px 3px;
+        color: #000000;
+        padding: 1.5px 3.5px;
         border-radius: 3px;
     }
     
     pre {
-        background-color: #0f172a;
-        color: #f8fafc;
-        padding: 10px;
-        border-radius: 5px;
+        background-color: #f8fafc;
+        color: #000000;
+        border: 1.5px solid #cbd5e1;
+        padding: 12px;
+        border-radius: 4px;
         overflow-x: auto;
-        margin-bottom: 1.2em;
+        margin-top: 1em;
+        margin-bottom: 1.5em;
     }
     
     pre code {
@@ -269,11 +273,11 @@ def compile_paper():
     }
     
     blockquote {
-        margin: 1.2em 0;
-        padding: 8px 15px;
+        margin: 1.5em 0;
+        padding: 10px 20px;
         background-color: #f8fafc;
-        border-left: 3px solid #3b82f6;
-        color: #334155;
+        border-left: 4px solid #000000;
+        color: #111111;
         font-style: italic;
         border-radius: 0 4px 4px 0;
     }
@@ -281,38 +285,48 @@ def compile_paper():
     table {
         width: 100%;
         border-collapse: collapse;
-        margin: 1.5em 0;
-        font-size: 9pt;
+        margin: 2em 0;
+        font-size: 9.5pt;
+        border-top: 2px solid #000000;
+        border-bottom: 2px solid #000000;
     }
     
     th, td {
-        border-top: 1px solid #cbd5e1;
-        border-bottom: 1px solid #cbd5e1;
-        padding: 6px 10px;
+        border: none;
+        padding: 8px 12px;
         text-align: left;
     }
     
     th {
         font-family: 'Inter', sans-serif;
-        font-weight: 600;
-        color: #0f172a;
-        background-color: #f8fafc;
+        font-weight: 700;
+        color: #000000;
+        border-bottom: 1.5px solid #000000;
+        background-color: transparent;
+    }
+    
+    td {
+        border-bottom: 1px solid #cbd5e1;
+    }
+    
+    tr:last-child td {
+        border-bottom: none;
     }
     
     ul, ol {
         margin-top: 0;
-        margin-bottom: 1em;
-        padding-left: 18px;
+        margin-bottom: 1.2em;
+        padding-left: 20px;
     }
     
     li {
-        margin-bottom: 0.4em;
+        margin-bottom: 0.5em;
     }
     
     hr {
         border: 0;
-        border-top: 1px solid #cbd5e1;
-        margin: 2em 0;
+        border-top: 1.5px solid #cbd5e1;
+        margin: 2.5em 0;
     }
     """
     
