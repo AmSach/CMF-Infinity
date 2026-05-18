@@ -147,11 +147,15 @@ def train(args: argparse.Namespace) -> None:
                 state_dict = payload["model"]
                 cleaned_state_dict = {}
                 for k, v in state_dict.items():
-                    # Strip any torch.compile _orig_mod. prefix if present
-                    if k.startswith("_orig_mod."):
-                        cleaned_state_dict[k[len("_orig_mod."):]] = v
-                    else:
-                        cleaned_state_dict[k] = v
+                    key = k
+                    while True:
+                        if key.startswith("_orig_mod."):
+                            key = key[len("_orig_mod."):]
+                        elif key.startswith("module."):
+                            key = key[len("module."):]
+                        else:
+                            break
+                    cleaned_state_dict[key] = v
                 model.load_state_dict(cleaned_state_dict)
                 start_step = payload["training"]["step"]
                 # Mathematically calculate exact tokens seen by a single rank up to this step to prevent exponential multiplication bug
