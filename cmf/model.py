@@ -511,6 +511,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         velocity_epsilon: float = 0.005,
         stochastic_langevin: bool = True,
         langevin_noise_scale: float = 1e-4,
+        sharp_memory_scale: float = 0.0, # Default to 0.0 to match training distribution perfectly, dial up to test sharp recall!
     ) -> torch.Tensor:
         self.eval()
         generated = input_ids
@@ -537,12 +538,12 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 )
                 
                 # Dynamic Gravitational Retrieval of sharp context details (Parameter-Free & zero KV-Cache VRAM death!)
-                if context.size(1) > 1:
+                if sharp_memory_scale > 0.0 and context.size(1) > 1:
                     past_contexts = context[:, :-1]
                     sim = torch.matmul(z.unsqueeze(1), past_contexts.transpose(-1, -2)).squeeze(1) / math.sqrt(z.size(-1))
                     weights = torch.softmax(sim, dim=-1)
                     c_sharp = torch.matmul(weights.unsqueeze(1), past_contexts).squeeze(1)
-                    c_effective = c_last + 0.15 * c_sharp
+                    c_effective = c_last + sharp_memory_scale * c_sharp
                 else:
                     c_effective = c_last
                 
