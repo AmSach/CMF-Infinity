@@ -204,7 +204,7 @@ def train(args: argparse.Namespace) -> None:
 
         else:
             model = model.to(device)
-            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, find_unused_parameters=True)
     else:
         model = model.to(device)
 
