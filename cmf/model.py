@@ -507,18 +507,69 @@ class DeliberativeContinuousMeaningField(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        use_velocity_halting: bool = True,
+        velocity_epsilon: float = 0.005,
     ) -> torch.Tensor:
         self.eval()
         generated = input_ids
+        
         for _ in range(max_new_tokens):
-            outputs = self(generated)
-            logits = outputs["logits"][:, -1] / max(temperature, 1e-6)
+            # Run context encoder on the full active sequence
+            context = self.encoder(self.embedding(generated))
+            # Grab the last position's context representation
+            c_last = context[:, -1]
+            
+            # Project to initial continuous state
+            z = self.initial_state(c_last)
+            
+            steps = self._thinking_budget()
+            flat_goal = None
+            
+            for step_idx in range(steps):
+                tau_value = (step_idx + 0.5) / float(steps)
+                tau = torch.full(
+                    (input_ids.size(0),),
+                    tau_value,
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+                
+                # Dynamic field velocity
+                velocity = self.field(z, c_last, tau, goal=flat_goal)
+                proposal = z + velocity / float(steps)
+                gate_input = torch.cat([z, proposal, c_last], dim=-1)
+                gate = torch.sigmoid(self.update_gate(gate_input))
+                
+                # Calculate change magnitude (velocity)
+                delta_z = gate * (proposal - z)
+                z_next = z + delta_z
+                
+                if use_velocity_halting:
+                    # L2 norm over model dimension
+                    velocity_norm = torch.norm(delta_z, p=2, dim=-1)
+                    if torch.all(velocity_norm < velocity_epsilon):
+                        z = z_next
+                        break
+                else:
+                    # Fallback to standard learned halting head
+                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_next)))
+                    if torch.all(halt_prob >= self.config.halting_threshold):
+                        z = z_next
+                        break
+                
+                z = z_next
+            
+            # Predict the next token from final state
+            logits = self.output(self.state_norm(z)) / max(temperature, 1e-6)
+            
             if top_k is not None:
                 values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
                 logits = logits.masked_fill(logits < values[:, [-1]], float("-inf"))
+                
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
+            
         return generated
 
 
