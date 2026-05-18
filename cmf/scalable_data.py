@@ -202,6 +202,9 @@ def cached_lm_batches_from_shards(
     batches_per_shard: int = 1024,
     delete_consumed: bool = False,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    import queue
+    import threading
+
     shards = list_token_cache_shards(path)
     if batches_per_shard < 1:
         raise ValueError("batches_per_shard must be positive")
@@ -210,6 +213,17 @@ def cached_lm_batches_from_shards(
     epoch = 0
     generator = torch.Generator()
     generator.manual_seed(seed)
+
+    # Worker thread to load shards asynchronously in the background
+    def shard_loader_worker(shard_paths, q):
+        for p in shard_paths:
+            try:
+                tokens, metadata = load_token_cache(p)
+                q.put((tokens, metadata, p), block=True)
+            except Exception as e:
+                print(f"Error asynchronously loading shard {p}: {e}")
+                q.put(None, block=True)
+        q.put(None, block=True) # Sentinel to signal end of stream
 
     while num_batches is None or produced < num_batches:
         shards = list_token_cache_shards(path)
@@ -220,11 +234,26 @@ def cached_lm_batches_from_shards(
         else:
             shard_order = shards
 
-        for shard_idx, shard_path in enumerate(shard_order):
+        # Spawn the background pre-loader thread to buffer up to 2 shards in CPU RAM
+        preload_queue = queue.Queue(maxsize=2)
+        loader_thread = threading.Thread(
+            target=shard_loader_worker,
+            args=(shard_order, preload_queue),
+            daemon=True
+        )
+        loader_thread.start()
+
+        for shard_idx in range(len(shard_order)):
             remaining = None if num_batches is None else num_batches - produced
             if remaining is not None and remaining <= 0:
                 return
-            tokens, _metadata = load_token_cache(shard_path)
+
+            # Retrieve pre-loaded token tensor from background queue instantly (Zero I/O block!)
+            payload = preload_queue.get()
+            if payload is None:
+                break
+            tokens, _metadata, shard_path = payload
+
             if random_batches:
                 shard_batches = batches_per_shard if remaining is None else min(batches_per_shard, remaining)
                 iterator = cached_lm_batches(

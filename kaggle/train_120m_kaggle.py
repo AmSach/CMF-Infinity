@@ -69,17 +69,16 @@ def main():
         str(ROOT / "scripts" / "train_distributed.py"),
         "--preset", "infinity-reasoning-0.12b",
         "--token-cache-dir", str(data_dir),
-        "--micro-batch-size", "16",
+        "--micro-batch-size", "32",
         "--grad-accum", "2",
         "--lr", "1.5e-4", # Adjusted learning rate for stable 120M convergence
  
         "--seq-len", "512",
-        "--steps", "6103515", # (200,000,000,000 / 32,768) matches the exact 200 Billion token budget!
+        "--steps", "3051757", # (200,000,000,000 / 65,536) matches the exact 200 Billion token budget!
         "--amp",
         "--tf32",
         "--gradient-checkpointing",
         "--compile",
-        "--fsdp",
         "--delete-consumed-shards",
         "--log-every", "1",
         "--save-every", "10",
