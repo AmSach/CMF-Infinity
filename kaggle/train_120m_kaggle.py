@@ -79,6 +79,7 @@ def main():
         "--gradient-checkpointing",
         "--compile",
         "--fsdp",
+        "--delete-consumed-shards",
         "--log-every", "1",
         "--save-every", "10",
         "--package-out", str(ROOT / "records" / "checkpoints" / "cmf_120m_reasoning.package.pt"),

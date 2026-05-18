@@ -200,6 +200,7 @@ def cached_lm_batches_from_shards(
     seed: int = 0,
     pin_memory: bool = False,
     batches_per_shard: int = 1024,
+    delete_consumed: bool = False,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     shards = list_token_cache_shards(path)
     if batches_per_shard < 1:
@@ -212,7 +213,8 @@ def cached_lm_batches_from_shards(
 
     while num_batches is None or produced < num_batches:
         shards = list_token_cache_shards(path)
-        if random_batches and len(shards) > 1:
+        # If delete_consumed is active, do not shuffle shards to maintain lockstep order across ranks
+        if random_batches and len(shards) > 1 and not delete_consumed:
             order = torch.randperm(len(shards), generator=generator).tolist()
             shard_order = [shards[idx] for idx in order]
         else:
@@ -237,6 +239,17 @@ def cached_lm_batches_from_shards(
                 for batch in iterator:
                     produced += 1
                     yield batch
+                
+                # Delete consumed shard files to preserve strict disk limits
+                if delete_consumed:
+                    try:
+                        p = Path(shard_path)
+                        p.unlink(missing_ok=True)
+                        p.with_suffix(".pt.json").unlink(missing_ok=True)
+                        p.with_name(p.name + ".json").unlink(missing_ok=True)
+                        print(f"\n--- [Disk Cleanup] Successfully deleted consumed shard {p.name} ---", flush=True)
+                    except Exception as e:
+                        print(f"Warning: Failed to delete consumed shard {shard_path}: {e}")
                 continue
 
             max_start = tokens.numel() - seq_len - 1
@@ -254,6 +267,17 @@ def cached_lm_batches_from_shards(
                 produced += 1
                 cursor += batch_size * seq_len
                 yield x, y
+            
+            # Delete consumed shard files to preserve strict disk limits (sequential path)
+            if delete_consumed:
+                try:
+                    p = Path(shard_path)
+                    p.unlink(missing_ok=True)
+                    p.with_suffix(".pt.json").unlink(missing_ok=True)
+                    p.with_name(p.name + ".json").unlink(missing_ok=True)
+                    print(f"\n--- [Disk Cleanup] Successfully deleted consumed shard {p.name} ---", flush=True)
+                except Exception as e:
+                    print(f"Warning: Failed to delete consumed shard {shard_path}: {e}")
         epoch += 1
 
 

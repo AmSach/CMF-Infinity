@@ -270,6 +270,7 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed + rank,
         pin_memory=device.type == "cuda",
         batches_per_shard=args.cache_batches_per_shard,
+        delete_consumed=(rank == 0 and args.delete_consumed_shards),
     )
 
     model.train()
@@ -459,6 +460,7 @@ def main():
     parser.add_argument("--cache-batches-per-shard", type=int, default=512)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--fsdp", action="store_true", help="Enable Fully Sharded Data Parallel (FSDP)")
+    parser.add_argument("--delete-consumed-shards", action="store_true", help="Delete consumed token cache shards to save disk space")
     parser.add_argument("--package-out", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_final.package.pt")
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_steps")
     args = parser.parse_args()

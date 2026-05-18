@@ -12,21 +12,21 @@ from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The Master AGI Recipe Mix
+# The Master AGI Recipe Mix (Expanded with strict ratio balance)
 DATASET_CONFIGS = [
     {
         "name": "fineweb-edu",
         "path": "HuggingFaceTB/smollm-corpus",
         "name_subset": "fineweb-edu-dedup",
         "text_column": "text",
-        "ratio": 0.50, # 50% general high-density knowledge
+        "ratio": 0.35, # 35% general high-density educational knowledge
     },
     {
         "name": "cosmopedia-v2",
         "path": "HuggingFaceTB/cosmopedia-v2",
         "name_subset": None,
         "text_column": "text",
-        "ratio": 0.30, # 30% synthetic textbooks/courses
+        "ratio": 0.25, # 25% synthetic textbooks and courses
     },
     {
         "name": "stack-code",
@@ -36,11 +36,25 @@ DATASET_CONFIGS = [
         "ratio": 0.15, # 15% clean algorithm logic
     },
     {
+        "name": "open-web-math",
+        "path": "open-web-math/open-web-math",
+        "name_subset": None,
+        "text_column": "text",
+        "ratio": 0.10, # 10% rigorous LaTeX mathematical text
+    },
+    {
+        "name": "proof-pile-2",
+        "path": "EleutherAI/proof-pile-2",
+        "name_subset": "algebraic-stack",
+        "text_column": "text",
+        "ratio": 0.10, # 10% scientific papers & formal proofs
+    },
+    {
         "name": "math-cot-reasoning",
         "path": "Qwen/Qwen2.5-Math-1.1M-CoT",
         "name_subset": None,
         "text_column": "cot_content", # Uses explicit step-by-step thinking traces
-        "ratio": 0.05, # 5% high-intensity chain-of-thought logic
+        "ratio": 0.05, # 5% high-intensity chain-of-thought planning
     }
 ]
 
