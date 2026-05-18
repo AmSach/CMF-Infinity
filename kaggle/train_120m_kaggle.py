@@ -17,12 +17,13 @@ def main():
     run([sys.executable, "-m", "pip", "install", "ninja"])
 
     # 2. Parallel Tokenization (Fast Path)
-    data_dir = ROOT / "records" / "data" / "fineweb_edu_2b"
+    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_cache"
     target_tokens = 1_500_000_000 # 1.5B tokens is the perfect scientific target for a 12-hour 2x T4 run
     
     # Kill any zombie tokenizer processes from aborted runs to prevent file locks/contention
     try:
         subprocess.run(["pkill", "-f", "prepare_hf_token_parallel.py"], capture_output=True)
+        subprocess.run(["pkill", "-f", "prepare_hybrid_datasets.py"], capture_output=True)
     except Exception:
         pass
     
@@ -33,7 +34,7 @@ def main():
             print(f"\n--- [INFO] Found {len(existing_shards)} existing token shards already on disk! ---")
             print(f"--- The tokenizer will resume downloading and parsing starting at Shard {len(existing_shards)} ---\n")
         else:
-            print(f"\n--- Preparing {target_tokens:,} tokens using Parallel Tokenizer (BACKGROUND PROCESS) ---\n")
+            print(f"\n--- Preparing {target_tokens:,} tokens using Parallel Interleaved Mixer (BACKGROUND PROCESS) ---\n")
         
         # Launch tokenization as a background process redirecting stdout/stderr to a dedicated log file
         log_file = ROOT / "records" / "tokenizer_output.log"
@@ -41,16 +42,14 @@ def main():
         log_handle = open(log_file, "w", encoding="utf-8")
         
         tok_proc = subprocess.Popen([
-            sys.executable, str(ROOT / "scripts" / "prepare_hf_token_parallel.py"),
-            "--dataset", "HuggingFaceTB/smollm-corpus",
-            "--dataset-name", "fineweb-edu-dedup",
+            sys.executable, str(ROOT / "scripts" / "prepare_hybrid_datasets.py"),
             "--target-tokens", str(target_tokens),
             "--shard-tokens", "25000000",
             "--output-dir", str(data_dir),
             "--append-eos"
         ], stdout=log_handle, stderr=subprocess.STDOUT)
         
-        print(f"--- Parallel Tokenizer launched in background. ---")
+        print(f"--- Parallel Interleaved Mixer launched in background. ---")
         print(f"--- All downloader/tokenizer output is logged to: {log_file} ---")
         print("--- You can view the live download/tokenizer progress anytime by running: !tail -n 20 /kaggle/working/records/tokenizer_output.log ---\n")
     else:
