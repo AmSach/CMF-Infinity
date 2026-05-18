@@ -4,6 +4,146 @@ import re
 from pathlib import Path
 from markdown_pdf import MarkdownPdf, Section
 
+def find_matching_brace(text: str, start_idx: int) -> int:
+    """Finds the index of the matching closing curly brace for the one at start_idx."""
+    count = 1
+    for i in range(start_idx + 1, len(text)):
+        if text[i] == '{':
+            count += 1
+        elif text[i] == '}':
+            count -= 1
+            if count == 0:
+                return i
+    return -1
+
+def parse_fractions(text: str) -> str:
+    """Parses LaTeX \\frac{num}{den} recursively by matching curly braces correctly."""
+    while True:
+        match = re.search(r"\\frac\s*\{", text)
+        if not match:
+            break
+        start_num = match.end() - 1  # index of '{'
+        end_num = find_matching_brace(text, start_num)
+        if end_num == -1:
+            break
+        num = text[start_num + 1:end_num]
+        
+        # Now find the denominator, which must immediately follow or have spaces
+        rest = text[end_num + 1:]
+        match_den = re.match(r"\s*\{", rest)
+        if not match_den:
+            break
+        start_den = end_num + 1 + match_den.end() - 1
+        end_den = find_matching_brace(text, start_den)
+        if end_den == -1:
+            break
+        den = text[start_den + 1:end_den]
+        
+        # Replace the fraction block in the text
+        fraction_str = text[match.start():end_den + 1]
+        # Clean both numerator and denominator recursively
+        num_clean = parse_fractions(num)
+        den_clean = parse_fractions(den)
+        text = text.replace(fraction_str, f"({num_clean}) / ({den_clean})")
+    return text
+
+def parse_sqrts(text: str) -> str:
+    """Parses LaTeX \\sqrt{expr} recursively by matching curly braces correctly."""
+    while True:
+        match = re.search(r"\\sqrt\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        expr = text[start_idx + 1:end_idx]
+        expr_clean = parse_sqrts(expr)
+        sqrt_str = text[match.start():end_idx + 1]
+        text = text.replace(sqrt_str, f"√({expr_clean})")
+    return text
+
+def parse_bf_and_text(text: str) -> str:
+    """Parses LaTeX \\mathbf{...} and \\text{...} recursively by matching curly braces correctly."""
+    # Process \mathbf
+    while True:
+        match = re.search(r"\\mathbf\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        content = text[start_idx + 1:end_idx]
+        content_clean = parse_bf_and_text(content)
+        bf_str = text[match.start():end_idx + 1]
+        text = text.replace(bf_str, f"<b>{content_clean}</b>")
+        
+    # Process \text
+    while True:
+        match = re.search(r"\\text\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        content = text[start_idx + 1:end_idx]
+        content_clean = parse_bf_and_text(content)
+        text_str = text[match.start():end_idx + 1]
+        text = text.replace(text_str, content_clean)
+        
+    # Process \mathrm
+    while True:
+        match = re.search(r"\\mathrm\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        content = text[start_idx + 1:end_idx]
+        content_clean = parse_bf_and_text(content)
+        mathrm_str = text[match.start():end_idx + 1]
+        text = text.replace(mathrm_str, content_clean)
+        
+    return text
+
+def parse_sub_superscripts(text: str) -> str:
+    """Parses LaTeX _{...} and ^{...} recursively by matching curly braces correctly."""
+    # Process _{...}
+    while True:
+        match = re.search(r"\_\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        content = text[start_idx + 1:end_idx]
+        content_clean = parse_sub_superscripts(content)
+        sub_str = text[match.start():end_idx + 1]
+        text = text.replace(sub_str, f"<sub>{content_clean}</sub>")
+        
+    # Process ^{...}
+    while True:
+        match = re.search(r"\^\s*\{", text)
+        if not match:
+            break
+        start_idx = match.end() - 1
+        end_idx = find_matching_brace(text, start_idx)
+        if end_idx == -1:
+            break
+        content = text[start_idx + 1:end_idx]
+        content_clean = parse_sub_superscripts(content)
+        sup_str = text[match.start():end_idx + 1]
+        text = text.replace(sup_str, f"<sup>{content_clean}</sup>")
+        
+    # Process single char subscripts/superscripts
+    text = re.sub(r"\_([a-zA-Z0-9])", r"<sub>\1</sub>", text)
+    text = re.sub(r"\^([a-zA-Z0-9])", r"<sup>\1</sup>", text)
+    return text
+
 def preprocess_math(text: str) -> str:
     """Converts LaTeX equations in Markdown to beautiful HTML/Unicode representations."""
     processed = text
@@ -11,10 +151,6 @@ def preprocess_math(text: str) -> str:
     # Helper to clean up mathematical LaTeX syntax inside equations
     def clean_latex(latex: str) -> str:
         html = latex
-        
-        # Replace LaTeX bold/text tags
-        html = re.sub(r"\\mathbf\{([a-zA-Z0-9_+=\-*|/()\[\]\s]+)\}", r"<b>\1</b>", html)
-        html = re.sub(r"\\text\{([a-zA-Z0-9_+=\-*|/()\[\]\s]+)\}", r"\1", html)
         
         # Standard replacements
         html = html.replace(r"\mathbb{R}", "ℝ")
@@ -38,17 +174,11 @@ def preprocess_math(text: str) -> str:
         html = html.replace(r"\left", "")
         html = html.replace(r"\right", "")
         
-        # Square roots \sqrt{expression}
-        html = re.sub(r"\\sqrt\{([^}]+)\}", r"&radic;<span style='border-top: 1px solid; padding-top: 1px;'>\1</span>", html)
-        
-        # Fractions \frac{numerator}{denominator}
-        html = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1) / (\2)", html)
-        
-        # Subscripts and Superscripts (braced first, then single characters)
-        html = re.sub(r"\^\{([^}]+)\}", r"<sup>\1</sup>", html)
-        html = re.sub(r"\_\{([^}]+)\}", r"<sub>\1</sub>", html)
-        html = re.sub(r"\^([a-zA-Z0-9])", r"<sup>\1</sup>", html)
-        html = re.sub(r"\_([a-zA-Z0-9])", r"<sub>\1</sub>", html)
+        # Parse LaTeX elements using curly brace matching
+        html = parse_bf_and_text(html)
+        html = parse_sqrts(html)
+        html = parse_fractions(html)
+        html = parse_sub_superscripts(html)
         
         return html
 
@@ -131,9 +261,22 @@ def compile_paper():
     custom_css = """
     @import url('https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
     
-    body {
+    /* Strict Black & White, No-Background Stylesheet to prevent PyMuPDF/weasyprint container rectangle overlaps */
+    
+    /* Force all layout and textual elements to be transparent by default */
+    * {
+        background-color: transparent !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+    }
+    
+    /* Explicitly define body background as pure white and text as pure black */
+    html, body {
+        background-color: #ffffff !important;
+        background: #ffffff !important;
+        color: #000000 !important;
         font-family: 'Lora', 'Georgia', serif;
-        color: #000000;
         line-height: 1.6;
         font-size: 10.5pt;
         margin: 25mm 20mm 20mm 20mm;
@@ -148,7 +291,7 @@ def compile_paper():
         font-family: 'Inter', sans-serif;
         font-size: 22pt;
         font-weight: 700;
-        color: #000000;
+        color: #000000 !important;
         margin-top: 20px;
         margin-bottom: 15px;
         line-height: 1.25;
@@ -165,18 +308,18 @@ def compile_paper():
         font-family: 'Inter', sans-serif;
         font-size: 12.5pt;
         font-weight: 600;
-        color: #000000;
+        color: #000000 !important;
     }
     
     .author-affiliation {
         font-size: 10pt;
-        color: #334155;
+        color: #000000 !important;
         font-style: italic;
     }
     
     .author-email {
         font-size: 9pt;
-        color: #475569;
+        color: #000000 !important;
     }
     
     .abstract-box {
@@ -184,8 +327,8 @@ def compile_paper():
         margin: 25px auto 30px auto;
         padding-top: 15px;
         padding-bottom: 15px;
-        border-top: 1.5px solid #000000;
-        border-bottom: 1.5px solid #000000;
+        border-top: 1.5px solid #000000 !important;
+        border-bottom: 1.5px solid #000000 !important;
         text-align: justify;
     }
     
@@ -196,20 +339,20 @@ def compile_paper():
         text-transform: uppercase;
         letter-spacing: 0.8px;
         margin-bottom: 8px;
-        color: #000000;
+        color: #000000 !important;
         text-align: center;
     }
     
     .abstract-text {
         font-size: 9.5pt;
         line-height: 1.5;
-        color: #000000;
+        color: #000000 !important;
         margin: 0;
     }
     
     h2, h3, h4 {
         font-family: 'Inter', sans-serif;
-        color: #000000;
+        color: #000000 !important;
         font-weight: 700;
         margin-top: 2em;
         margin-bottom: 0.6em;
@@ -217,14 +360,14 @@ def compile_paper():
     
     h2 {
         font-size: 13.5pt;
-        border-bottom: 1.5px solid #000000;
+        border-bottom: 1.5px solid #000000 !important;
         padding-bottom: 4px;
         margin-top: 2.2em;
     }
     
     h3 {
         font-size: 11.5pt;
-        border-bottom: 1px solid #cbd5e1;
+        border-bottom: 1px solid #000000 !important;
         padding-bottom: 2px;
     }
     
@@ -233,6 +376,7 @@ def compile_paper():
         margin-bottom: 1.2em;
         text-align: justify;
         text-justify: inter-word;
+        color: #000000 !important;
     }
     
     .equation {
@@ -241,76 +385,71 @@ def compile_paper():
         margin: 20px 0;
         font-size: 11pt;
         font-family: 'Lora', 'Georgia', serif;
-        color: #000000;
+        color: #000000 !important;
     }
     
     code {
         font-family: 'Fira Code', monospace;
         font-size: 8.5pt;
-        background-color: #f1f5f9;
-        color: #000000;
-        padding: 1.5px 3.5px;
-        border-radius: 3px;
+        color: #000000 !important;
+        padding: 0px 2px;
     }
     
+    /* Code blocks use simple thin solid border, no colored background */
     pre {
-        background-color: #f8fafc;
-        color: #000000;
-        border: 1.5px solid #cbd5e1;
+        color: #000000 !important;
+        border: 1px solid #000000 !important;
         padding: 12px;
-        border-radius: 4px;
+        border-radius: 0px !important;
         overflow-x: auto;
         margin-top: 1em;
         margin-bottom: 1.5em;
     }
     
     pre code {
-        background-color: transparent;
-        color: inherit;
-        padding: 0;
-        border-radius: 0;
+        color: #000000 !important;
         font-size: 8pt;
     }
     
+    /* Blockquotes use classic black left line with zero background color */
     blockquote {
         margin: 1.5em 0;
         padding: 10px 20px;
-        background-color: #f8fafc;
-        border-left: 4px solid #000000;
-        color: #111111;
+        border-left: 3px solid #000000 !important;
+        color: #000000 !important;
         font-style: italic;
-        border-radius: 0 4px 4px 0;
     }
     
+    /* booktabs table: pure black rules, no vertical lines, no backgrounds */
     table {
         width: 100%;
         border-collapse: collapse;
         margin: 2em 0;
         font-size: 9.5pt;
-        border-top: 2px solid #000000;
-        border-bottom: 2px solid #000000;
+        border-top: 2px solid #000000 !important;
+        border-bottom: 2px solid #000000 !important;
     }
     
     th, td {
-        border: none;
+        border: none !important;
         padding: 8px 12px;
         text-align: left;
+        color: #000000 !important;
     }
     
     th {
         font-family: 'Inter', sans-serif;
         font-weight: 700;
-        color: #000000;
-        border-bottom: 1.5px solid #000000;
-        background-color: transparent;
+        color: #000000 !important;
+        border-bottom: 1.5px solid #000000 !important;
     }
     
     td {
-        border-bottom: 1px solid #cbd5e1;
+        border-bottom: 1px solid #cbd5e1 !important;
     }
     
     tr:last-child td {
-        border-bottom: none;
+        border-bottom: none !important;
     }
     
     ul, ol {
@@ -321,11 +460,12 @@ def compile_paper():
     
     li {
         margin-bottom: 0.5em;
+        color: #000000 !important;
     }
     
     hr {
         border: 0;
-        border-top: 1.5px solid #cbd5e1;
+        border-top: 1.5px solid #000000 !important;
         margin: 2.5em 0;
     }
     """
