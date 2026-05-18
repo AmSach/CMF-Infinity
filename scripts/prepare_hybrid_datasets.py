@@ -3,8 +3,9 @@ import sys
 import time
 import json
 import argparse
+import queue
+import threading
 from pathlib import Path
-import itertools
 
 import torch
 from datasets import load_dataset
@@ -58,6 +59,29 @@ DATASET_CONFIGS = [
     }
 ]
 
+# Dedicated high-speed background pre-fetch worker
+def dataset_producer(cfg: dict, q: queue.Queue):
+    while True:
+        try:
+            # Streams chunks asynchronously from HF servers
+            ds = load_dataset(
+                cfg["path"],
+                cfg["name_subset"],
+                split="train",
+                streaming=True
+            )
+            col = cfg["text_column"]
+            for row in ds:
+                text = row.get(col, "")
+                if text and len(text.strip()) > 0:
+                    # Blocks automatically when the queue hits capacity to prevent RAM exhaustion
+                    q.put(text, block=True)
+            print(f"\n[Producer INFO] Stream {cfg['name']} reached end. Loop restarting...")
+        except Exception as e:
+            # Automatic fault-tolerant reconnect on network glitches
+            print(f"\n[Producer Reconnect] Stream {cfg['name']} encountered a connection hiccup: {e}. Retrying in 2 seconds...")
+            time.sleep(2)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer-name", default="gpt2")
@@ -80,30 +104,27 @@ def main():
                 tokens_saved += payload["tokens"].numel()
             except Exception as e:
                 print(f"Warning: Failed to load existing shard {shard_file}: {e}")
-        print(f"\n--- [RESUME] Found {len(existing_shards)} existing shards on disk ({tokens_saved:,} tokens). Fast-forwarding mix generator... ---\n")
+        print(f"\n--- [RESUME] Found {len(existing_shards)} shards on disk ({tokens_saved:,} tokens). Fast-forwarding active mix... ---\n")
 
-    # 2. Setup streaming dataset iterators
-    print("--- [STREAMING INITIALIZATION] Opening AGI-Recipe Datasets ---")
-    iterators = {}
+    # 2. Spawn dedicated background worker threads for each dataset stream
+    print("--- [ASYNCHRONOUS ENGINE] Launching Multithreaded Pre-Fetching Queues ---")
+    queues = {}
+    threads = []
     for cfg in DATASET_CONFIGS:
-        print(f"Streaming {cfg['name']} from {cfg['path']} (Ratio: {cfg['ratio']:.0%})...")
-        try:
-            ds = load_dataset(
-                cfg["path"],
-                cfg["name_subset"],
-                split="train",
-                streaming=True
-            )
-            iterators[cfg["name"]] = iter(ds)
-        except Exception as e:
-            # Fallback for Qwen dataset structure if needed
-            print(f"Note: Standard split load failed for {cfg['name']}, trying default load: {e}")
-            ds = load_dataset(cfg["path"], split="train", streaming=True)
-            iterators[cfg["name"]] = iter(ds)
+        # Buffer up to 30,000 texts in RAM per stream to completely absorb internet latency spikes
+        q = queue.Queue(maxsize=30000)
+        queues[cfg["name"]] = q
+        
+        t = threading.Thread(
+            target=dataset_producer, 
+            args=(cfg, q), 
+            name=f"producer_{cfg['name']}",
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+        print(f"   -> Spawned background pre-fetch thread: {t.name} (Max Queue: 30,000 docs)")
 
-    # Calculate token allocation targets per dataset config
-    tokens_per_source = {cfg["name"]: int(args.target_tokens * cfg["ratio"]) for cfg in DATASET_CONFIGS}
-    
     tokens_seen = 0
     shard_idx = 0
     shard_tokens = []
@@ -114,10 +135,8 @@ def main():
     
     start_time = time.perf_counter()
     
-    # We round-robin through datasets based on target ratios to keep a uniform sequence mix
-    # This prevents training from seeing all math, then all code, then all textbooks
-    cycle_index = 0
-    batch_size = 2000
+    # High-throughput batch size for Rust parallel tokenizer
+    batch_size = 4000
     
     def save_shard(tokens_list, idx):
         flat_tokens = [t for sublist in tokens_list for t in sublist]
@@ -137,55 +156,47 @@ def main():
             json.dump(shard_meta, f)
         return tensor.numel()
 
-    print("\n--- Starting Parallel Tokenization and Interleaved Mixing ---\n")
+    print("\n--- [BLAZING FAST] Active Tokenization Loop Engaged ---\n")
+    
+    # Wait briefly for queues to warm up and buffer initial content
+    print("Pre-warming queues (waiting 5 seconds)...")
+    time.sleep(5)
     
     while tokens_seen < args.target_tokens:
         batch_texts = []
-        # Draw batch items proportionally from the round-robin mix
+        
+        # Interleave records based on ratios from pre-fetched queues
         for cfg in DATASET_CONFIGS:
             num_items = max(1, int(batch_size * cfg["ratio"]))
-            iterator = iterators[cfg["name"]]
-            col = cfg["text_column"]
+            q = queues[cfg["name"]]
             
             for _ in range(num_items):
                 try:
-                    row = next(iterator)
-                    text = row.get(col, "")
-                    if text:
-                        batch_texts.append(text)
-                except StopIteration:
-                    # Reinstate iterator if exhausted to keep ratio stable
-                    print(f"\n[INFO] Dataset {cfg['name']} exhausted. Restarting stream...")
-                    ds = load_dataset(cfg["path"], cfg["name_subset"], split="train", streaming=True)
-                    iterators[cfg["name"]] = iter(ds)
-                    try:
-                        row = next(iterators[cfg["name"]])
-                        text = row.get(col, "")
-                        if text:
-                            batch_texts.append(text)
-                    except Exception:
-                        pass
+                    # Fast non-blocking pull
+                    text = q.get_nowait()
+                    batch_texts.append(text)
+                except queue.Empty:
+                    # If empty, move to next queue to prevent stalling the loop
+                    break
         
         if not batch_texts:
-            print("Warning: All dataset streams returned empty items. Retrying...")
-            time.sleep(1)
+            # Queues momentarily starving; sleep briefly to allow producers to buffer
+            time.sleep(0.05)
             continue
             
-        # Parallel Tokenize batch
+        # Re-batch to maximize Rust parallel tokenization throughput
         tokenized = tokenizer(batch_texts, add_special_tokens=False)["input_ids"]
         
-        # Fast skipping loop to resume instantly
+        # High-speed parallel fast-skipping resume logic
         if skipping_mode:
             batch_counts = [len(ids) + (1 if args.append_eos else 0) for ids in tokenized]
             sum_counts = sum(batch_counts)
             if skipped_tokens + sum_counts < tokens_saved:
                 skipped_tokens += sum_counts
-                # Print status
                 pct = (skipped_tokens / tokens_saved) * 100.0
-                print(f"[Resume-Mix] Skipping already tokenized rows... {skipped_tokens:,}/{tokens_saved:,} ({pct:.1f}%)", end="\r", flush=True)
+                print(f"[Asynchronous Resume] Skipping cached tokens... {skipped_tokens:,}/{tokens_saved:,} ({pct:.1f}%)", end="\r", flush=True)
                 continue
                 
-        # Processing active tokens
         for ids in tokenized:
             if args.append_eos:
                 ids.append(tokenizer.eos_token_id)
@@ -197,7 +208,7 @@ def main():
                     skipping_mode = False
                     tokens_seen = tokens_saved
                     shard_idx = len(existing_shards)
-                    print(f"\n--- [RESUME COMPLETE] Mixed streams fast-forwarded successfully. Resuming active token cache generation at Shard {shard_idx}! ---\n")
+                    print(f"\n--- [RESUME COMPLETE] Asynchronous queues synchronized. Starting token cache at Shard {shard_idx}! ---\n")
                 continue
             
             shard_tokens.append(ids)
@@ -206,7 +217,7 @@ def main():
             
             if shard_token_count >= args.shard_tokens:
                 save_shard(shard_tokens, shard_idx)
-                print(f"\n[SHARD SAVED] Shard {shard_idx} successfully written ({shard_token_count:,} tokens). Total processed: {tokens_seen:,}/{args.target_tokens:,} tokens.\n")
+                print(f"\n[SHARD WRITE SUCCESS] Shard {shard_idx} saved ({shard_token_count:,} tokens). Total processed: {tokens_seen:,}/{args.target_tokens:,}.\n")
                 shard_idx += 1
                 shard_tokens = []
                 shard_token_count = 0
@@ -215,6 +226,9 @@ def main():
             elapsed = time.perf_counter() - start_time
             tok_s = (tokens_seen - tokens_saved) / max(elapsed, 1e-6)
             percentage = (tokens_seen / args.target_tokens) * 100.0
+            
+            # Queue fills tracking to monitor thread efficiency
+            queue_stats = ", ".join([f"{cfg['name']}: {queues[cfg['name']].qsize()}" for cfg in DATASET_CONFIGS])
             
             remaining_tokens = max(0, args.target_tokens - tokens_seen)
             eta_seconds = remaining_tokens / max(tok_s, 1e-6)
@@ -225,15 +239,15 @@ def main():
             else:
                 eta_str = f"{eta_seconds:.0f} secs"
                 
-            print(f"[Mixer Progress] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
-                  f"Shard {shard_idx} progress: {shard_token_count:,}/{args.shard_tokens:,} | "
+            print(f"[Asynchronous Mixer] {tokens_seen:,} / {args.target_tokens:,} tokens ({percentage:.4f}%) | "
+                  f"Shard {shard_idx}: {shard_token_count:,}/{args.shard_tokens:,} | "
                   f"Speed: {tok_s:.0f} tok/s | ETA: {eta_str}", end="\r", flush=True)
 
     if shard_tokens and tokens_seen < args.target_tokens:
         save_shard(shard_tokens, shard_idx)
         shard_idx += 1
         
-    # Write CMF conformant manifest file
+    # Final CMF manifest
     manifest = {
         "format": "cmf.token_cache_dir.v1",
         "tokens_count": tokens_seen,
