@@ -322,10 +322,12 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     body_content = re.sub(r"### Abstract.*?(\n##|$)", "\\1", body_content, flags=re.DOTALL)
     body_content = re.sub(r"^---\s*$", "", body_content, flags=re.MULTILINE) # remove top dividers
     
-    # Handle Image tag paths specifically if markdown processor expects absolute paths
-    # (Since we are rendering from memory string, relative image links might break)
-    image_base = f"file:///{str(md_path.parent).replace(chr(92), '/')}/"
-    body_content = re.sub(r"!\[(.*?)\]\((.*?\.png)\)", rf"![\1]({image_base}\2)", body_content)
+    # MarkdownPdf handles relative paths natively for markdown tags. We wrap it in a page-break-avoid block.
+    # Note: We must use \n\n inside the HTML div so the markdown parser processes the image tag.
+    body_content = body_content.replace(
+        "![Continuous Meaning Field Trajectory Schematic](cmf_trajectory_schematic.png)",
+        '<div style="page-break-inside: avoid; margin: 15px auto; text-align: center;">\n\n![Continuous Meaning Field Trajectory Schematic](cmf_trajectory_schematic.png)\n\n</div>'
+    )
     
     # Reassemble with NeurIPS/ICML custom header/abstract block (CRITICAL: ZERO INDENTATION to avoid markdown code-block bug!)
     html_header = f"""<div class="paper-header">
@@ -471,16 +473,21 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
         color: #000000 !important;
     }
     
-    .equation, .inline-equation {
+    .math-block, .math-inline, .equation, .inline-equation {
         font-family: 'Times New Roman', Times, serif !important;
     }
     
-    .equation {
+    .math-block, .equation {
         text-align: center;
         margin: 10px 0;
-        font-size: 10pt;
+        font-size: 10.5pt !important;
         display: block;
         color: #000000 !important;
+    }
+    
+    .math-inline {
+        font-size: 10.5pt !important;
+        font-style: italic;
     }
     
     sup, sub {

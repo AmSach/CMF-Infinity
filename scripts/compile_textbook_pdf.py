@@ -239,7 +239,7 @@ def preprocess_math(text: str, output_dir: Path) -> str:
                 
         # Determine appropriate math canvas size and text size
         # We start with a large figure and crop tightly using bbox_inches='tight'
-        fig = plt.figure(figsize=(10, 4), facecolor='#ffffff')
+        fig = plt.figure(figsize=(10, 4), facecolor='#fdfbf7')
         
         formula = eq_text
         if not formula.startswith('$'):
@@ -255,7 +255,7 @@ def preprocess_math(text: str, output_dir: Path) -> str:
             filepath,
             dpi=300,
             transparent=False,
-            facecolor='#ffffff',
+            facecolor='#fdfbf7',
             bbox_inches='tight',
             pad_inches=0.015 if is_block else 0.005
         )
@@ -320,14 +320,12 @@ def compile_textbook():
     # Preprocess all equations inside the textbook dynamically
     processed_content = preprocess_math(md_content, output_dir=workspace_dir / "docs")
     
-    # Resolve relative image links in Markdown to absolute local URLs for WeasyPrint
-    def resolve_image_path(match):
-        alt_text = match.group(1)
-        rel_path = match.group(2)
-        abs_path = (md_path.parent / rel_path).resolve()
-        return f"![{alt_text}](file:///{str(abs_path).replace(chr(92), '/')})"
-    
-    processed_content = re.sub(r"!\[(.*?)\]\((.*?\.png)\)", resolve_image_path, processed_content)
+    # MarkdownPdf handles relative paths natively for markdown tags. We wrap the specific image in a page-break-avoid block.
+    # Note: We must use \n\n inside the HTML div so the markdown parser processes the image tag.
+    processed_content = processed_content.replace(
+        "![Continuous Meaning Field Trajectory Schematic](cmf_trajectory_schematic.png)",
+        '<div style="page-break-inside: avoid; margin: 15px auto; text-align: center;">\n\n![Continuous Meaning Field Trajectory Schematic](cmf_trajectory_schematic.png)\n\n</div>'
+    )
         
     # Standard premium academic/spaceflight CSS stylesheet
     custom_css = """
@@ -348,83 +346,89 @@ def compile_textbook():
         text-shadow: none !important;
     }
     
-    /* Explicitly define body background as soft off-white and text as warm off-black */
-    html, body, p, span, blockquote, pre, code, ul, ol, li, h1, h2, h3, h4, h5, h6, table, tr, th, td {
-        font-family: Helvetica, Arial, sans-serif !important;
+    /* Apply Lora (elegant serif) as the primary body font */
+    html, body, p, span, blockquote, ul, ol, li, table, tr, th, td {
+        font-family: 'Lora', Georgia, serif !important;
+    }
+
+    /* Apply Fira Code for code blocks */
+    pre, code {
+        font-family: 'Fira Code', monospace !important;
     }
     
     p, li, blockquote, td, ol, ul {
-        font-weight: 600 !important;
+        font-weight: 400 !important;
     }
     
     h1, h2, h3, h4, h5, h6 {
+        font-family: 'Outfit', sans-serif !important;
         font-weight: 800 !important;
+        color: #0f172a !important; /* Deep Slate */
     }
     
     html, body {
-        background-color: #faf8f5 !important;
-        background: #faf8f5 !important;
-        color: #111111 !important;
-        line-height: 1.6;
-        font-size: 11pt;
+        background-color: #fdfbf7 !important; /* Premium Warm Cream */
+        background: #fdfbf7 !important;
+        color: #334155 !important; /* Elegant Slate Gray */
+        line-height: 1.7;
+        font-size: 11.5pt;
         margin: 0;
         padding: 0;
     }
     
     h1, h2, h3, h4 {
-        font-family: Helvetica, Arial, sans-serif !important;
-        color: #111111 !important;
-        font-weight: 600;
         margin-top: 1.5em;
         margin-bottom: 0.5em;
     }
     
     h1 {
-        font-size: 28pt;
+        font-size: 32pt;
         text-align: center;
         margin-top: 100px;
         margin-bottom: 20px;
-        color: #111111 !important;
+        color: #0f172a !important;
         font-weight: 800;
+        letter-spacing: -0.02em;
     }
     
     h2 {
-        font-size: 18pt;
-        border-bottom: 1.5px solid #111111 !important;
-        padding-bottom: 6px;
+        font-size: 20pt;
+        border-bottom: 1.5px solid #cbd5e1 !important;
+        padding-bottom: 8px;
         margin-top: 2em;
-        color: #111111 !important;
+        color: #1e293b !important;
         page-break-before: always;
+        letter-spacing: -0.01em;
     }
     
     h3 {
-        font-size: 13pt;
-        color: #111111 !important;
+        font-size: 15pt;
+        color: #334155 !important;
         margin-top: 1.5em;
     }
     
     p {
         margin-top: 0;
-        margin-bottom: 1em;
+        margin-bottom: 1.2em;
         text-align: justify;
-        color: #111111 !important;
+        color: #334155 !important;
     }
     
     /* Mathematical Equation Styling */
-    .equation, .inline-equation {
+    .math-block, .math-inline, .equation, .inline-equation {
         font-family: 'Times New Roman', Times, serif !important;
     }
     
-    .inline-equation {
+    .math-inline, .inline-equation {
         font-style: italic;
         padding: 0 1px;
     }
     
-    .inline-equation .fraction {
+    .math-inline .fraction, .inline-equation .fraction {
         font-size: 85%;
     }
     
-    .equation {
+    .math-block, .equation {
         text-align: center;
         margin: 15px 0;
         font-size: 11.5pt;
@@ -605,9 +609,9 @@ def compile_textbook():
     print(f"Saving compiled PDF to temporary path {temp_path}...")
     pdf.save(str(temp_path))
     
-    # Post-processing: Re-open the compiled PDF to paint the off-white background (#faf8f5) on the canvas behind the text
+    # Post-processing: Re-open the compiled PDF to paint the off-white background (#fdfbf7) on the canvas behind the text
     doc = fitz.open(temp_path)
-    bg_color = (1.0, 1.0, 1.0)
+    bg_color = (253/255, 251/255, 247/255)
     for page in doc:
         page.wrap_contents()
         page.draw_rect(page.rect, color=bg_color, fill=bg_color, overlay=False)
