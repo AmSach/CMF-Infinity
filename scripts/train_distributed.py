@@ -244,11 +244,19 @@ def train(args: argparse.Namespace) -> None:
     
     # 2. Add Cosine Warmup Learning Rate Scheduler for ultimate stability
     from torch.optim.lr_scheduler import LambdaLR
+    total_scheduler_steps = args.steps
+    if checkpoint_exists and not has_nan and getattr(args, "reset_scheduler", False):
+        total_scheduler_steps = args.steps - start_step
+
     def lr_lambda(current_step: int):
         warmup_steps = args.warmup_steps
+        if getattr(args, "reset_scheduler", False) and checkpoint_exists and not has_nan:
+            # Warm up for 500 steps (or standard warmup if shorter) when resetting scheduler on resume
+            warmup_steps = min(500, args.warmup_steps)
+            
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(max(1, args.steps - warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_scheduler_steps - warmup_steps))
         progress = min(1.0, progress)
         min_lr_ratio = args.min_lr_ratio
         return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -256,10 +264,14 @@ def train(args: argparse.Namespace) -> None:
 
     # Step the scheduler to match the restored step count
     if checkpoint_exists and not has_nan:
-        for _ in range(start_step):
-            scheduler.step()
-        if is_master:
-            print(f"Resumed scheduler state to step {start_step}")
+        if getattr(args, "reset_scheduler", False):
+            if is_master:
+                print(f"Resumed training at step {start_step}. Resetting learning rate scheduler with {total_scheduler_steps} steps and re-warmup.")
+        else:
+            for _ in range(start_step):
+                scheduler.step()
+            if is_master:
+                print(f"Resumed scheduler state to step {start_step}")
 
 
     if is_fsdp:
@@ -544,6 +556,7 @@ def main():
     parser.add_argument("--empty-cache-every", type=int, default=100, help="Empty CUDA cache every N steps to prevent OOM fragmentation")
     parser.add_argument("--package-out", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_final.package.pt")
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "records" / "checkpoints" / "cmf_0.5b_steps")
+    parser.add_argument("--reset-scheduler", action="store_true", help="Reset learning rate scheduler to step 0 when resuming for adaptive warmup")
     args = parser.parse_args()
     
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)

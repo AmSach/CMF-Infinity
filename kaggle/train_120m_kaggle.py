@@ -135,6 +135,11 @@ def auto_import_weights():
                 print("Please download the weights manually or configure Git LFS in your environment.")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset-scheduler", action="store_true", help="Reset learning rate scheduler to step 0 when resuming training for adaptive warmup")
+    args, unknown = parser.parse_known_args()
+
     # 0. Clean up space first to prevent disk full issues
     cleanup_disk_space()
     
@@ -193,7 +198,7 @@ def main():
     # For a 120M model, we can increase the micro-batch size to 4
     # and reduce grad-accum to 8 to keep the effective batch size at 64 (4 * 8 * 2 = 64)
     # while dramatically cutting sequential loop overhead and speeding up steps!
-    run([
+    cmd = [
         "torchrun",
         "--nproc_per_node=2",
         str(ROOT / "scripts" / "train_distributed.py"),
@@ -217,7 +222,10 @@ def main():
         "--save-every", "5",
         "--package-out", str(ROOT / "cmf_120m_reasoning.package.pt"),
         "--checkpoint-dir", str(ROOT)
-    ])
+    ]
+    if args.reset_scheduler:
+        cmd.append("--reset-scheduler")
+    run(cmd)
 
     if tok_proc is not None:
         print("Waiting for background parallel tokenizer to finish...")
