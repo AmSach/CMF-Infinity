@@ -171,8 +171,11 @@ def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
     model.train()
     optimizer.zero_grad()
     
+    # 5. Bypass torch.compile completely for this step to avoid 5-minute CPU recompilation freezes!
+    uncompiled_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    
     with torch.amp.autocast(device_type=device.type, enabled=args.amp):
-        out = model(generated_padded[:, :-1])
+        out = uncompiled_model(generated_padded[:, :-1])
         logits = out["logits"]
         target_ids = generated_padded[:, 1:].unsqueeze(-1)
         token_log_probs = F.log_softmax(logits, dim=-1).gather(-1, target_ids).squeeze(-1)
@@ -484,9 +487,9 @@ def train(args: argparse.Namespace) -> None:
         scheduler.step()
         
         # --- JOINT AGI DISCOVERY: Interleaved GRPO Self-Play ---
-        # Every 50 optimizer steps, the model generates its own math problem, 
+        # Every 20 optimizer steps, the model generates its own math problem, 
         # verifies the logic, and backpropagates the discovery reward.
-        if step > 0 and step % 50 == 0:
+        if step > 0 and step % 20 == 0:
             try:
                 enc = tiktoken.get_encoding("gpt2")
                 rl_reward, rl_text, rl_target = run_grpo_self_play(model, enc, device, scaler, optimizer, args)
