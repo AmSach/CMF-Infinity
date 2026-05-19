@@ -204,9 +204,15 @@ def preprocess_math(text: str, output_dir: Path) -> str:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import shutil
     
-    # Create math images output directory
+    # Create math images output directory (force clear cache to update transparent backgrounds to solid white)
     img_dir = output_dir / "math_images"
+    if img_dir.exists():
+        try:
+            shutil.rmtree(img_dir)
+        except Exception:
+            pass
     img_dir.mkdir(parents=True, exist_ok=True)
     
     # Configure matplotlib for premium textbook Computer Modern serif math typography
@@ -233,7 +239,7 @@ def preprocess_math(text: str, output_dir: Path) -> str:
                 
         # Determine appropriate math canvas size and text size
         # We start with a large figure and crop tightly using bbox_inches='tight'
-        fig = plt.figure(figsize=(10, 4))
+        fig = plt.figure(figsize=(10, 4), facecolor='#ffffff')
         
         formula = eq_text
         if not formula.startswith('$'):
@@ -248,7 +254,8 @@ def preprocess_math(text: str, output_dir: Path) -> str:
         fig.savefig(
             filepath,
             dpi=300,
-            transparent=True,
+            transparent=False,
+            facecolor='#ffffff',
             bbox_inches='tight',
             pad_inches=0.015 if is_block else 0.005
         )
@@ -312,6 +319,15 @@ def compile_textbook():
         
     # Preprocess all equations inside the textbook dynamically
     processed_content = preprocess_math(md_content, output_dir=workspace_dir / "docs")
+    
+    # Resolve relative image links in Markdown to absolute local URLs for WeasyPrint
+    def resolve_image_path(match):
+        alt_text = match.group(1)
+        rel_path = match.group(2)
+        abs_path = (md_path.parent / rel_path).resolve()
+        return f"![{alt_text}](file:///{str(abs_path).replace(chr(92), '/')})"
+    
+    processed_content = re.sub(r"!\[(.*?)\]\((.*?\.png)\)", resolve_image_path, processed_content)
         
     # Standard premium academic/spaceflight CSS stylesheet
     custom_css = """
@@ -591,7 +607,7 @@ def compile_textbook():
     
     # Post-processing: Re-open the compiled PDF to paint the off-white background (#faf8f5) on the canvas behind the text
     doc = fitz.open(temp_path)
-    bg_color = (250 / 255.0, 248 / 255.0, 245 / 255.0)
+    bg_color = (1.0, 1.0, 1.0)
     for page in doc:
         page.wrap_contents()
         page.draw_rect(page.rect, color=bg_color, fill=bg_color, overlay=False)

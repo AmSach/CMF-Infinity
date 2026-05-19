@@ -15,6 +15,8 @@ In this textbook, we present the complete theory, mathematical physics, and arch
 
 To teach this vast ocean of knowledge to both academic researchers and keen 14-year-old students, we will construct **one, single, mathematically precise analogy**: **The Physics of Semantic Trajectories**. Every mathematical formula, every layer, and every optimization in your CMF codebase behaves exactly like a particle moving through a continuous force field governed by gravity, velocity, friction, and stochastic energy. Welcome to the voyage.
 
+![Continuous Meaning Field Trajectory Schematic](../paper/cmf_trajectory_schematic.png)
+
 ---
 
 ## 🛰️ CHAPTER 1: Foundations of Semantic Coordinate Spaces (What is Machine Learning?)

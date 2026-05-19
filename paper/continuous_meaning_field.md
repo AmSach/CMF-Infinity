@@ -30,22 +30,7 @@ To bypass these limits, we propose the **Continuous Meaning Field (CMF)**. CMF m
 
 By casting language modeling as a continuous boundary-value problem, we unlock the ability to adjust the integration step size dynamically (taking micro-steps through complex semantic terrain and long, fast leaps through easy empty space) while maintaining a flat, linear-time ($O(N)$) memory footprint.
 
-```
-       RIGID TRANSITIONAL STAIRCASE (TRANSFORMER)
-       Layer L3:   [x1] ----> [x2] ----> [x3]
-                     |          |          |
-       Layer L2:   [x1] ----> [x2] ----> [x3]
-                     |          |          |
-       Layer L1:   [x1] ----> [x2] ----> [x3]
-                  (Rigid token-aligned compute steps)
-                  
-       GEODESIC MEANING FLOW TRAJECTORY (CMF)
-       z(0.0) -----> z(0.2) --- [Thermal Vibration] ---> z(0.6) -----> z(1.0)
-         |             |                                   |             |
-         v             v                                   v             v
-       [=== Dilated CNN Prompt Landscape Potential Field: C(x) ===]
-                  (Continuous, dynamically bounded geodesic flight)
-```
+![Continuous Meaning Field Trajectory Schematic](cmf_trajectory_schematic.png)
 
 ---
 
