@@ -345,7 +345,30 @@ def train(args: argparse.Namespace) -> None:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             
             with torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
-                out = model(x, labels=y, gradient_checkpointing=args.gradient_checkpointing)
+                # Dynamic SFT Label Masking for Joint Ingestion
+                # Mask out 'User: ... \nAssistant:' so loss is only computed on the response.
+                # 'User:' -> [12982, 25], '\nAssistant:' -> [198, 48902, 25]
+                if getattr(args, "apply_sft_mask", True):
+                    # We create a boolean mask for the prompt regions
+                    y_masked = y.clone()
+                    for b in range(y.size(0)):
+                        # Very fast heuristic: if it looks like an Alpaca format string, we mask up to 'Assistant:'
+                        seq = x[b].tolist()
+                        if 12982 in seq and 48902 in seq: # Quick filter
+                            in_prompt = False
+                            for i in range(len(seq) - 2):
+                                if seq[i] == 12982 and seq[i+1] == 25: # "User:"
+                                    in_prompt = True
+                                if in_prompt:
+                                    y_masked[b, i] = -100
+                                if seq[i] == 198 and seq[i+1] == 48902 and seq[i+2] == 25: # "\nAssistant:"
+                                    in_prompt = False
+                                    y_masked[b, i:i+3] = -100
+                    
+                    out = model(x, labels=y_masked, gradient_checkpointing=args.gradient_checkpointing)
+                else:
+                    out = model(x, labels=y, gradient_checkpointing=args.gradient_checkpointing)
+                
                 loss = out["loss"] / args.grad_accum
             
             scaler.scale(loss).backward()
@@ -550,6 +573,7 @@ def main():
     parser.add_argument("--cache-batches-per-shard", type=int, default=512)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--fsdp", action="store_true", help="Enable Fully Sharded Data Parallel (FSDP)")
+    parser.add_argument("--apply-sft-mask", action="store_true", default=True, help="Dynamically mask User prompts with -100 for Joint Ingestion")
     parser.add_argument("--delete-consumed-shards", action="store_true", help="Delete consumed token cache shards to save disk space")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of learning rate warmup steps")
     parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum learning rate ratio relative to base lr")
