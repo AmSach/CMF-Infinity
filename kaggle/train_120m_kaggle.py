@@ -147,8 +147,7 @@ def main():
     run([sys.executable, "-m", "pip", "install", "ninja"])
 
     # 2. Parallel Tokenization (Fast Path)
-    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_cache"
-    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_cache"
+    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_mixed_v2"
     target_tokens = 200_000_000_000 # 200 Billion tokens for absolute hyper-saturation of the 120M model weights
     
     # Kill any zombie tokenizer processes from aborted runs to prevent file locks/contention
@@ -223,20 +222,6 @@ def main():
     if tok_proc is not None:
         print("Waiting for background parallel tokenizer to finish...")
         tok_proc.wait()
-
-    # 4. Start Supervised Fine-Tuning (SFT) Alignment automatically
-    print("\n--- [CMF-v2 Alignment] Starting Supervised Fine-Tuning (SFT) Alignment ---")
-    run([
-        sys.executable,
-        str(ROOT / "scripts" / "train_sft_v2.py"),
-        "--base-checkpoint", "checkpoint_latest.pt",
-        "--out-package", str(ROOT / "cmf_120m_reasoning.package.pt"),
-        "--lr", "3e-5",
-        "--epochs", "5",
-        "--batch-size", "4",
-        "--solver-method", "symplectic"
-    ])
-    print("--- [CMF-v2 Alignment] SFT Alignment complete! Aligned package saved to cmf_120m_reasoning.package.pt ---")
 
 if __name__ == "__main__":
     main()

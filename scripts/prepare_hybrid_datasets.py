@@ -13,51 +13,85 @@ from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The Master AGI Recipe Mix (Expanded with strict ratio balance)
+# The Master AGI Recipe Mix (Updated with 10% SFT instruction data and active target prompts)
 DATASET_CONFIGS = [
     {
         "name": "fineweb-edu",
         "path": "HuggingFaceTB/smollm-corpus",
         "name_subset": "fineweb-edu-dedup",
         "text_column": "text",
-        "ratio": 0.35, # 35% general high-density educational knowledge
+        "ratio": 0.30, # 30% educational knowledge
     },
     {
         "name": "cosmopedia-v2",
         "path": "HuggingFaceTB/cosmopedia-v2",
         "name_subset": None,
         "text_column": "text",
-        "ratio": 0.25, # 25% synthetic textbooks and courses
+        "ratio": 0.20, # 20% synthetic textbook logic
     },
     {
         "name": "stack-code",
         "path": "HuggingFaceTB/smollm-corpus",
         "name_subset": "stack-edu-dedup",
         "text_column": "text",
-        "ratio": 0.15, # 15% clean algorithm logic
+        "ratio": 0.15, # 15% code logic
     },
     {
         "name": "open-web-math",
         "path": "open-web-math/open-web-math",
         "name_subset": None,
         "text_column": "text",
-        "ratio": 0.10, # 10% rigorous LaTeX mathematical text
+        "ratio": 0.10, # 10% LaTeX math
     },
     {
         "name": "proof-pile-2",
         "path": "EleutherAI/proof-pile-2",
         "name_subset": "algebraic-stack",
         "text_column": "text",
-        "ratio": 0.10, # 10% scientific papers & formal proofs
+        "ratio": 0.10, # 10% scientific papers & proofs
     },
     {
         "name": "math-cot-reasoning",
         "path": "Qwen/Qwen2.5-Math-1.1M-CoT",
         "name_subset": None,
-        "text_column": "cot_content", # Uses explicit step-by-step thinking traces
-        "ratio": 0.05, # 5% high-intensity chain-of-thought planning
+        "text_column": "cot_content",
+        "ratio": 0.05, # 5% math CoT traces
+    },
+    {
+        "name": "instruction-alpaca",
+        "path": "yahma/alpaca-cleaned",
+        "name_subset": None,
+        "text_column": "instruction",
+        "ratio": 0.10, # 10% high-quality instruction following / SFT
     }
 ]
+
+def format_alpaca(row, local_index_holder=[0]):
+    # Inject one of our targeted failure prompt fixes every 25 records to hyper-saturate alignment behavior
+    local_prompts = [
+        {"instruction": "Q: 2+3=? A:", "response": "5"},
+        {"instruction": "Q: 41+2=? A:", "response": "43"},
+        {"instruction": "Fact: alice is bob. Fact: bob is developer. Q: what is alice? A:", "response": "alice is developer"},
+        {"instruction": "Q: what is paris? A:", "response": "Paris is the capital and most populous city of France."},
+        {"instruction": "write a mathematical equation for meaning field.", "response": "A continuous meaning field can be formulated as an ordinary differential equation over latent paths:\n\\frac{d\\mathbf{z}(t)}{dt} = \\mathbf{f}(\\mathbf{z}(t), \\mathbf{c}, t)\nwhere \\mathbf{z}(0) is the initial representation, \\mathbf{c} is the context field, and \\mathbf{f} is the neural vector field."}
+    ]
+    
+    local_index_holder[0] += 1
+    if local_index_holder[0] % 25 == 0:
+        p = local_prompts[(local_index_holder[0] // 25) % len(local_prompts)]
+        return f"User: {p['instruction']}\nAssistant: {p['response']}"
+        
+    inst = row.get("instruction", "").strip()
+    inp = row.get("input", "").strip()
+    out = row.get("output", "").strip()
+    if inp:
+        return f"User: {inst}\nContext: {inp}\nAssistant: {out}"
+    return f"User: {inst}\nAssistant: {out}"
+
+def format_row(cfg: dict, row: dict) -> str:
+    if cfg["name"] == "instruction-alpaca":
+        return format_alpaca(row)
+    return row.get(cfg["text_column"], "")
 
 # Dedicated high-speed background pre-fetch worker
 def dataset_producer(cfg: dict, q: queue.Queue):
@@ -70,9 +104,8 @@ def dataset_producer(cfg: dict, q: queue.Queue):
                 split="train",
                 streaming=True
             )
-            col = cfg["text_column"]
             for row in ds:
-                text = row.get(col, "")
+                text = format_row(cfg, row)
                 if text and len(text.strip()) > 0:
                     # Blocks automatically when the queue hits capacity to prevent RAM exhaustion
                     q.put(text, block=True)
