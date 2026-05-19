@@ -92,6 +92,12 @@ def initialize_weights(model: torch.nn.Module, num_layers: int):
                     module.weight.data.mul_(1.0 / math.sqrt(2.0 * num_layers))
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+    # Target any raw parameters (like memory/anchors) that are not inside modules
+    for name, param in model.named_parameters():
+        if "memory" in name or "anchor" in name:
+            with torch.no_grad():
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
 
 def train(args: argparse.Namespace) -> None:
     rank, local_rank, world_size, device = setup_distributed()
@@ -122,6 +128,7 @@ def train(args: argparse.Namespace) -> None:
     start_step = 0
     tokens_seen = 0
     has_nan = False
+    payload = None
     
     latest_ckpt = args.checkpoint_dir / "checkpoint_latest.pt"
     if not latest_ckpt.exists() and args.checkpoint_dir.exists():
@@ -129,13 +136,18 @@ def train(args: argparse.Namespace) -> None:
         if ckpt_files:
             latest_ckpt = ckpt_files[-1]
 
-    if is_master:
-        if latest_ckpt.exists():
-            checkpoint_exists = True
-            print(f"--- [RESUME] Found latest checkpoint at {latest_ckpt}. Restoring weights on Rank 0 CPU! ---")
+    if latest_ckpt.exists():
+        checkpoint_exists = True
+        try:
+            # All ranks load the checkpoint payload to CPU to restore model, optimizer, and scaler states
             payload = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
-            
-            # Check for NaNs
+        except Exception as e:
+            if is_master:
+                print(f"Error loading checkpoint payload: {e}")
+
+    if checkpoint_exists and payload is not None:
+        # Check for NaNs on Rank 0
+        if is_master:
             if "model" in payload:
                 for k, v in payload["model"].items():
                     if torch.is_tensor(v) and torch.isnan(v).any():
@@ -148,31 +160,33 @@ def train(args: argparse.Namespace) -> None:
                     latest_ckpt.unlink()
                 except Exception as e:
                     print(f"Error unlinking corrupted checkpoint: {e}")
-            else:
-                # Load weights into the unwrapped model on Rank 0 CPU
-                state_dict = payload["model"]
-                cleaned_state_dict = {}
-                for k, v in state_dict.items():
-                    key = k
-                    while True:
-                        if key.startswith("_orig_mod."):
-                            key = key[len("_orig_mod."):]
-                        elif key.startswith("module."):
-                            key = key[len("module."):]
-                        else:
-                            break
-                    cleaned_state_dict[key] = v
-                model.load_state_dict(cleaned_state_dict)
-                start_step = payload["training"]["step"]
-                # Mathematically calculate exact tokens seen by a single rank up to this step to prevent exponential multiplication bug
-                tokens_seen = start_step * args.micro_batch_size * args.grad_accum * config.max_seq_len
-                print(f"Successfully loaded weights into unwrapped model on CPU (cleaned _orig_mod prefix). Ready for distributed wrapping!")
 
     if world_size > 1:
-        # Broadcast metadata so all ranks agree on start_step, tokens_seen, and has_nan status
-        metadata = [checkpoint_exists, start_step, tokens_seen, has_nan]
+        # Broadcast metadata so all ranks agree on has_nan status
+        metadata = [has_nan]
         dist.broadcast_object_list(metadata, src=0)
-        checkpoint_exists, start_step, tokens_seen, has_nan = metadata
+        has_nan = metadata[0]
+
+    if checkpoint_exists and not has_nan and payload is not None:
+        # Load weights into the unwrapped model on CPU on all ranks
+        state_dict = payload["model"]
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            key = k
+            while True:
+                if key.startswith("_orig_mod."):
+                    key = key[len("_orig_mod."):]
+                elif key.startswith("module."):
+                    key = key[len("module."):]
+                else:
+                    break
+            cleaned_state_dict[key] = v
+        model.load_state_dict(cleaned_state_dict)
+        start_step = payload["training"]["step"]
+        # Mathematically calculate exact tokens seen by a single rank up to this step to prevent exponential multiplication bug
+        tokens_seen = start_step * args.micro_batch_size * args.grad_accum * config.max_seq_len
+        if is_master:
+            print(f"Successfully loaded model weights on Rank 0 CPU (cleaned _orig_mod prefix). Ready for distributed wrapping!")
 
     is_fsdp = False
     if world_size > 1:
@@ -253,6 +267,25 @@ def train(args: argparse.Namespace) -> None:
         scaler = ShardedGradScaler(enabled=args.amp and device.type == "cuda")
     else:
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+        
+    # 2.5 Restore optimizer and scaler state dicts on all ranks if resuming
+    if checkpoint_exists and not has_nan and payload is not None:
+        if "optimizer" in payload and payload["optimizer"] is not None:
+            try:
+                optimizer.load_state_dict(payload["optimizer"])
+                if is_master:
+                    print("Successfully restored optimizer state dict on all ranks!")
+            except Exception as e:
+                if is_master:
+                    print(f"Warning: Failed to restore optimizer state dict: {e}")
+        if "scaler" in payload and payload["scaler"] is not None and not is_fsdp:
+            try:
+                scaler.load_state_dict(payload["scaler"])
+                if is_master:
+                    print("Successfully restored grad scaler state dict on all ranks!")
+            except Exception as e:
+                if is_master:
+                    print(f"Warning: Failed to restore grad scaler state dict: {e}")
     
     # 3. Load default gpt2 tokenizer safely on master for saving standalone packages
     tokenizer = None
@@ -413,8 +446,21 @@ def train(args: argparse.Namespace) -> None:
                     if is_master:
                         # Copy state dict to CPU asynchronously
                         state_dict_to_save = {k: v.cpu() for k, v in model.state_dict().items()}
+                        
+                        # Copy optimizer state to CPU to avoid CPU/GPU async issues and memory leaks
+                        import copy
+                        opt_state = copy.deepcopy(optimizer.state_dict())
+                        for state in opt_state["state"].values():
+                            for k, v in state.items():
+                                if torch.is_tensor(v):
+                                    state[k] = v.cpu()
+                                    
+                        scaler_state = scaler.state_dict() if not is_fsdp else None
+                        
                         payload = {
                             "model": state_dict_to_save,
+                            "optimizer": opt_state,
+                            "scaler": scaler_state,
                             "config": config,
                             "training": {"step": step + 1, "tokens": tokens_seen * world_size}
                         }

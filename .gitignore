@@ -17,3 +17,11 @@ downloads/
 tokenizer.pkl
 cmf_generated_output.png
 .env
+
+# Build and rendering artifacts
+math_images/
+*_page_*.png
+test_*.png
+test_*.pdf
+/paper/test_*.pdf
+/paper/test_*.png
