@@ -224,5 +224,19 @@ def main():
         print("Waiting for background parallel tokenizer to finish...")
         tok_proc.wait()
 
+    # 4. Start Supervised Fine-Tuning (SFT) Alignment automatically
+    print("\n--- [CMF-v2 Alignment] Starting Supervised Fine-Tuning (SFT) Alignment ---")
+    run([
+        sys.executable,
+        str(ROOT / "scripts" / "train_sft_v2.py"),
+        "--base-checkpoint", "checkpoint_latest.pt",
+        "--out-package", str(ROOT / "cmf_120m_reasoning.package.pt"),
+        "--lr", "3e-5",
+        "--epochs", "5",
+        "--batch-size", "4",
+        "--solver-method", "symplectic"
+    ])
+    print("--- [CMF-v2 Alignment] SFT Alignment complete! Aligned package saved to cmf_120m_reasoning.package.pt ---")
+
 if __name__ == "__main__":
     main()

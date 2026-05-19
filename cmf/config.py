@@ -10,7 +10,7 @@ class CMFConfig:
     kernel_size: int = 3
     dropout: float = 0.1
     solver_steps_per_token: int = 4
-    solver_method: str = "euler"
+    solver_method: str = "symplectic"
     max_seq_len: int = 256
     causal: bool = True
     tie_embeddings: bool = True
