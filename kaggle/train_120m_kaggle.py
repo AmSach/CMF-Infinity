@@ -198,6 +198,7 @@ def main():
     # For a 120M model, we can increase the micro-batch size to 4
     # and reduce grad-accum to 8 to keep the effective batch size at 64 (4 * 8 * 2 = 64)
     # while dramatically cutting sequential loop overhead and speeding up steps!
+    checkpoint_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else ROOT
     cmd = [
         "torchrun",
         "--nproc_per_node=2",
@@ -220,8 +221,8 @@ def main():
         "--delete-consumed-shards",
         "--log-every", "1",
         "--save-every", "5",
-        "--package-out", str(ROOT / "cmf_120m_reasoning.package.pt"),
-        "--checkpoint-dir", str(ROOT)
+        "--package-out", str(checkpoint_dir / "cmf_120m_reasoning.package.pt"),
+        "--checkpoint-dir", str(checkpoint_dir)
     ]
     if args.reset_scheduler:
         cmd.append("--reset-scheduler")
