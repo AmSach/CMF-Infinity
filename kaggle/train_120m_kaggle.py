@@ -95,9 +95,51 @@ def cleanup_disk_space():
 
     print("--- [Space Saver Auto-Pilot] Scan complete. Output storage is optimized. ---\n")
 
+def auto_import_weights():
+    checkpoint_path = ROOT / "checkpoint_latest.pt"
+    print("\n--- [Git LFS Auto-Import] Checking checkpoint weights... ---")
+    
+    needs_pull = False
+    if not checkpoint_path.exists():
+        print("checkpoint_latest.pt does not exist locally. Will trigger Git LFS pull.")
+        needs_pull = True
+    elif checkpoint_path.stat().st_size < 1000:
+        print("Found checkpoint_latest.pt but it appears to be a Git LFS pointer file (< 1KB).")
+        needs_pull = True
+    else:
+        print(f"Verified checkpoint_latest.pt is present and valid ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
+        return
+        
+    if needs_pull:
+        print("Running 'git lfs install' and 'git lfs pull' to download the 612MB weights file...")
+        try:
+            subprocess.run(["git", "lfs", "install"], check=True, cwd=str(ROOT))
+            subprocess.run(["git", "lfs", "pull"], check=True, cwd=str(ROOT))
+            
+            if checkpoint_path.exists() and checkpoint_path.stat().st_size >= 1000:
+                print(f"Success! Downloaded checkpoint_latest.pt ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
+            else:
+                print("Warning: git lfs pull executed but checkpoint_latest.pt is still missing or a pointer.")
+        except Exception as e:
+            print(f"Error executing Git LFS commands: {e}")
+            print("Please ensure git-lfs is installed in the system. Trying to install git-lfs via apt...")
+            try:
+                subprocess.run(["apt-get", "update"], check=True)
+                subprocess.run(["apt-get", "install", "-y", "git-lfs"], check=True)
+                subprocess.run(["git", "lfs", "install"], check=True, cwd=str(ROOT))
+                subprocess.run(["git", "lfs", "pull"], check=True, cwd=str(ROOT))
+                if checkpoint_path.exists() and checkpoint_path.stat().st_size >= 1000:
+                    print(f"Success after apt-get! checkpoint_latest.pt downloaded ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
+            except Exception as apt_err:
+                print(f"Could not install git-lfs via apt-get: {apt_err}")
+                print("Please download the weights manually or configure Git LFS in your environment.")
+
 def main():
     # 0. Clean up space first to prevent disk full issues
     cleanup_disk_space()
+    
+    # 0.5 Auto-import weights if Git LFS checked out a pointer
+    auto_import_weights()
 
     # 1. Install dependencies
     print("--- Installing dependencies ---")
