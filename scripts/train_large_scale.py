@@ -131,13 +131,37 @@ def save_training_checkpoint(
 def maybe_resume(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> tuple[int, int]:
     if not path.exists():
         return 0, 0
-    payload = torch.load(path, map_location=device)
-    if payload.get("format") != "cmf.training_checkpoint.v1":
-        raise RuntimeError(f"{path} is not a CMF training checkpoint.")
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    optimizer.load_state_dict(payload["optimizer_state_dict"])
-    print(f"Resumed {path} at step {payload['step']} ({payload['tokens']} tokens).")
-    return int(payload["step"]), int(payload["tokens"])
+    payload = torch.load(path, map_location=device, weights_only=False)
+    
+    # Handle standard CMF v1 training checkpoint format
+    if payload.get("format") == "cmf.training_checkpoint.v1":
+        model.load_state_dict(payload["model_state_dict"], strict=True)
+        if "optimizer_state_dict" in payload:
+            optimizer.load_state_dict(payload["optimizer_state_dict"])
+        step = int(payload.get("step", 0))
+        tokens = int(payload.get("tokens", 0))
+        print(f"Resumed {path} at step {step} ({tokens} tokens).")
+        return step, tokens
+        
+    # Handle packaging/custom weights formats like checkpoint_latest.pt
+    model_state = payload.get("model", payload.get("model_state_dict", payload))
+    if isinstance(model_state, dict):
+        cleaned_state = {}
+        for k, v in model_state.items():
+            key = k.replace("_orig_mod.", "").replace("module.", "")
+            cleaned_state[key] = v
+        model.load_state_dict(cleaned_state)
+        
+        if "optimizer_state_dict" in payload:
+            optimizer.load_state_dict(payload["optimizer_state_dict"])
+            
+        training_meta = payload.get("training", {})
+        step = training_meta.get("step", 0) if isinstance(training_meta, dict) else 0
+        tokens = training_meta.get("tokens", 0) if isinstance(training_meta, dict) else 0
+        print(f"Resumed weights from {path} at step {step} ({tokens} tokens).")
+        return step, tokens
+        
+    raise RuntimeError(f"Could not parse checkpoint format at {path}.")
 
 
 def train(args: argparse.Namespace) -> None:
