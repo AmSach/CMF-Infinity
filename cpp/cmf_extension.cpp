@@ -16,7 +16,7 @@ torch::Tensor euler_integrate(torch::Tensor z0, torch::Tensor velocity, double d
 #ifdef WITH_CUDA
     return euler_integrate_cuda(z0, velocity, dt);
 #else
-    TORCH_CHECK(false, "cmf_cuda was built without CUDA support");
+    return euler_integrate_cpu(z0, velocity, dt);
 #endif
   }
   return euler_integrate_cpu(z0, velocity, dt);

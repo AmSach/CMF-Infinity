@@ -87,3 +87,29 @@ def test_precomputed_euler_matches_cumsum():
         ]
     )
     assert torch.allclose(states, expected)
+
+
+def test_symplectic_integrator_shapes():
+    config = CMFConfig(vocab_size=32, d_model=16, hidden_dim=32, num_layers=3, solver_method="symplectic")
+    model = ContinuousMeaningField(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    labels = torch.randint(0, config.vocab_size, (2, 8))
+
+    output = model(input_ids, labels=labels, return_states=True)
+
+    assert output["logits"].shape == (2, 8, config.vocab_size)
+    assert output["states"].shape == (2, 8, config.d_model)
+    assert output["loss"].ndim == 0
+
+
+def test_global_memory_router_shapes():
+    config = CMFConfig(vocab_size=32, d_model=16, hidden_dim=32, num_layers=3, use_global_memory_router=True)
+    model = ContinuousMeaningField(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    labels = torch.randint(0, config.vocab_size, (2, 8))
+
+    output = model(input_ids, labels=labels, return_states=True)
+
+    assert output["logits"].shape == (2, 8, config.vocab_size)
+    assert output["states"].shape == (2, 8, config.d_model)
+    assert output["loss"].ndim == 0

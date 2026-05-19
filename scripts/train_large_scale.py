@@ -236,6 +236,10 @@ def train(args: argparse.Namespace) -> None:
 
     train_seq_len = args.seq_len or config.max_seq_len
     model = init_model.to(device) if init_model is not None else build_model(model_type, config).to(device)
+    if init_model is None:
+        from scripts.train_distributed import initialize_weights
+        initialize_weights(model, config.num_layers)
+        print("Model weights initialized with strict scale matching (std=0.02).")
     if args.compile:
         try:
             model = torch.compile(model)  # type: ignore[assignment]

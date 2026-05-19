@@ -29,6 +29,50 @@ def rk4_step(
     k4 = field_fn(z + dt * k3, context, tau + dt)
     return z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
+def integrate_symplectic_leapfrog(
+    z0: torch.Tensor,
+    context: torch.Tensor,
+    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    steps: int,
+    dt: float,
+) -> torch.Tensor:
+    """Integrate for a fixed number of steps using a Symplectic Leapfrog (Verlet) scheme."""
+    z = z0.clone()
+    batch_size = z.size(0)
+    d_half = z.size(-1) // 2
+    
+    q = z[..., :d_half]
+    p = z[..., d_half:]
+    
+    for step_idx in range(steps):
+        tau = torch.full(
+            (batch_size,),
+            step_idx * dt,
+            dtype=z.dtype,
+            device=z.device,
+        )
+        
+        # 1. Half-step momentum update
+        z_q = torch.cat([q, torch.zeros_like(p)], dim=-1)
+        force = field_fn(z_q, context, tau)[..., d_half:]
+        p = p + 0.5 * dt * force
+        
+        # 2. Full-step position update
+        q = q + dt * p
+        
+        # 3. Full-step momentum update
+        tau_next = torch.full(
+            (batch_size,),
+            (step_idx + 1) * dt,
+            dtype=z.dtype,
+            device=z.device,
+        )
+        z_q_next = torch.cat([q, torch.zeros_like(p)], dim=-1)
+        force_next = field_fn(z_q_next, context, tau_next)[..., d_half:]
+        p = p + 0.5 * dt * force_next
+        
+    return torch.cat([q, p], dim=-1)
+
 def integrate_fixed(
     z0: torch.Tensor,
     context: torch.Tensor,
@@ -38,6 +82,8 @@ def integrate_fixed(
     method: str = "euler"
 ) -> torch.Tensor:
     """Integrate for a fixed number of steps."""
+    if method == "symplectic":
+        return integrate_symplectic_leapfrog(z0, context, field_fn, steps, dt)
     z = z0
     batch_size = z.size(0)
     for step_idx in range(steps):

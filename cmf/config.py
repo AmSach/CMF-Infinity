@@ -10,6 +10,7 @@ class CMFConfig:
     kernel_size: int = 3
     dropout: float = 0.1
     solver_steps_per_token: int = 4
+    solver_method: str = "euler"
     max_seq_len: int = 256
     causal: bool = True
     tie_embeddings: bool = True
@@ -24,6 +25,8 @@ class CMFConfig:
     min_thinking_steps: int = 1
     max_thinking_steps: int = 4
     halting_threshold: float = 0.85
+    # CMF-v2 upgrades
+    use_global_memory_router: bool = False
 
 
 @dataclass

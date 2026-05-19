@@ -73,6 +73,48 @@ class DilatedResidualBlock(nn.Module):
         return self.norm(residual + y)
 
 
+class GlobalMemoryRouter(nn.Module):
+    def __init__(self, d_model: int, n_heads: int = 4) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        if seq_len <= 1:
+            return x
+            
+        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1)
+        scores = scores + mask.unsqueeze(0).unsqueeze(0)
+        
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
+        return self.out_proj(out)
+
+
+class UpgradedContextEncoder(nn.Module):
+    def __init__(self, config: CMFConfig) -> None:
+        super().__init__()
+        self.cnn = DilatedContextEncoder(config)
+        self.router = GlobalMemoryRouter(config.d_model) if getattr(config, "use_global_memory_router", False) else nn.Identity()
+        
+    def forward(self, x: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
+        x_cnn = self.cnn(x, gradient_checkpointing=gradient_checkpointing)
+        return self.router(x_cnn)
+
+
 class DilatedContextEncoder(nn.Module):
     def __init__(self, config: CMFConfig) -> None:
         super().__init__()
@@ -133,6 +175,16 @@ class TimeFeatures(nn.Module):
         return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
+class FactualMemoryBank(nn.Module):
+    def __init__(self, num_anchors: int, d_model: int) -> None:
+        super().__init__()
+        self.memory = nn.Parameter(torch.randn(num_anchors, d_model))
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        attn_weights = torch.softmax(torch.matmul(z, self.memory.T) / math.sqrt(z.size(-1)), dim=-1)
+        return torch.matmul(attn_weights, self.memory)
+
+
 class VectorField(nn.Module):
     def __init__(self, config: CMFConfig) -> None:
         super().__init__()
@@ -148,8 +200,10 @@ class VectorField(nn.Module):
         self.proposal = nn.Linear(config.hidden_dim, config.d_model)
         self.gate = nn.Linear(config.hidden_dim, config.d_model)
         
-        # Semantic Gravity Anchors (Memory bank)
-        self.memory = nn.Parameter(torch.randn(32, config.d_model)) # 32 learned fact anchors
+        # Upgraded Factual Memory Bank (CMF-v2 sub-module registration)
+        self.memory_bank = FactualMemoryBank(32, config.d_model)
+        # Retain raw memory reference for strict backward compatibility with old checkpoint keys
+        self.memory = self.memory_bank.memory
         self.memory_proj = nn.Linear(config.d_model, config.hidden_dim)
 
     def forward(
@@ -160,11 +214,7 @@ class VectorField(nn.Module):
         goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         tfeat = self.time_features(tau)
-        
-        # Simple attention to memory anchors (factuality)
-        # Instead of full KV cache, we attend to fixed memory bank
-        attn_weights = torch.softmax(torch.matmul(z, self.memory.T) / math.sqrt(z.size(-1)), dim=-1)
-        m_context = torch.matmul(attn_weights, self.memory)
+        m_context = self.memory_bank(z)
         
         if goal is None:
             goal = torch.zeros_like(z)
@@ -181,13 +231,29 @@ class ContinuousMeaningField(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = DilatedContextEncoder(config)
+        self.encoder = UpgradedContextEncoder(config)
         self.initial_state = nn.Linear(config.d_model, config.d_model)
         self.field = VectorField(config)
         self.state_norm = nn.LayerNorm(config.d_model)
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.output.weight = self.embedding.weight
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("encoder.blocks."):
+                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
+                mapped_state_dict[new_key] = v
+            elif k == "field.memory":
+                mapped_state_dict["field.memory_bank.memory"] = v
+                mapped_state_dict["field.memory"] = v
+            else:
+                mapped_state_dict[k] = v
+        # Allow GMR router parameter omissions when loading old checkpoints
+        if getattr(self.config, "use_global_memory_router", False):
+            return super().load_state_dict(mapped_state_dict, strict=False)
+        return super().load_state_dict(mapped_state_dict, strict=strict)
 
     def forward(
         self,
@@ -225,7 +291,8 @@ class ContinuousMeaningField(nn.Module):
             else:
                 steps = self.config.solver_steps_per_token
                 dt = 1.0 / float(steps)
-                z = integrate_fixed(z, c_t, lambda _z, _c, _t: self.field(_z, _c, _t, goal=goal), steps, dt)
+                method = getattr(self.config, "solver_method", "euler")
+                z = integrate_fixed(z, c_t, lambda _z, _c, _t: self.field(_z, _c, _t, goal=goal), steps, dt, method=method)
                 total_steps += steps
             
             states.append(z)
@@ -379,7 +446,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = DilatedContextEncoder(config)
+        self.encoder = UpgradedContextEncoder(config)
         self.initial_state = nn.Linear(config.d_model, config.d_model)
         self.field = VectorField(config)
         self.update_gate = nn.Linear(config.d_model * 3, config.d_model)
@@ -388,6 +455,22 @@ class DeliberativeContinuousMeaningField(nn.Module):
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.output.weight = self.embedding.weight
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("encoder.blocks."):
+                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
+                mapped_state_dict[new_key] = v
+            elif k == "field.memory":
+                mapped_state_dict["field.memory_bank.memory"] = v
+                mapped_state_dict["field.memory"] = v
+            else:
+                mapped_state_dict[k] = v
+        # Allow GMR router parameter omissions when loading old checkpoints
+        if getattr(self.config, "use_global_memory_router", False):
+            return super().load_state_dict(mapped_state_dict, strict=False)
+        return super().load_state_dict(mapped_state_dict, strict=strict)
 
     def _thinking_budget(self) -> int:
         if self.config.adaptive_thinking:
@@ -509,9 +592,9 @@ class DeliberativeContinuousMeaningField(nn.Module):
         top_k: Optional[int] = None,
         use_velocity_halting: bool = True,
         velocity_epsilon: float = 0.005,
-        stochastic_langevin: bool = True,
-        langevin_noise_scale: float = 1e-4,
-        sharp_memory_scale: float = 0.0, # Default to 0.0 to match training distribution perfectly, dial up to test sharp recall!
+        stochastic_langevin: bool = False, # Disabled: Replaced by deterministic Symplectic Hamiltonian dynamics
+        langevin_noise_scale: float = 0.0,
+        sharp_memory_scale: float = 0.25, # Enabled by default for zero-shot attention sharpness!
     ) -> torch.Tensor:
         self.eval()
         generated = input_ids
@@ -537,7 +620,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     device=z.device,
                 )
                 
-                # Dynamic Gravitational Retrieval of sharp context details (Parameter-Free & zero KV-Cache VRAM death!)
+                # 1. Dynamic Cosine Steering (Zero-Shot Attention sharpness)
                 if sharp_memory_scale > 0.0 and context.size(1) > 1:
                     past_contexts = context[:, :-1]
                     sim = torch.matmul(z.unsqueeze(1), past_contexts.transpose(-1, -2)).squeeze(1) / math.sqrt(z.size(-1))
@@ -557,13 +640,20 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 delta_z = gate * (proposal - z)
                 z_next = z + delta_z
                 
-                # Algorithmic Cures for Continuous Sinks & Trajectory Crossings
-                if stochastic_langevin and temperature > 0.0:
-                    # Langevin thermal noise to escape entropy sinks
-                    noise = torch.randn_like(z_next) * langevin_noise_scale * temperature
-                    # High-frequency deterministic jitter to resolve trajectory crossings
-                    jitter = torch.sin(z_next * 1000.0) * 1e-6
-                    z_next = z_next + noise + jitter
+                # 2. Subspace Manifold Anchoring (Eliminates Solver Drift in FP16)
+                if context.size(1) > 1:
+                    sim_anchor = torch.matmul(z_next.unsqueeze(1), context.transpose(-1, -2)).squeeze(1) / math.sqrt(z_next.size(-1))
+                    w_anchor = torch.softmax(sim_anchor, dim=-1)
+                    z_proj = torch.matmul(w_anchor.unsqueeze(1), context).squeeze(1)
+                    # Anchor active state to the context landscape manifold softly (15% coordinate gravity)
+                    z_next = 0.85 * z_next + 0.15 * z_proj
+                
+                # 3. Hamiltonian Symplectic Curl Stabilization (Deterministic orbit around attractors, replaces loops)
+                d_half = delta_z.size(-1) // 2
+                delta_q = delta_z[..., :d_half]
+                delta_p = delta_z[..., d_half:]
+                symplectic_curl = torch.cat([delta_p, -delta_q], dim=-1)
+                z_next = z_next + 0.10 * symplectic_curl
                 
                 if use_velocity_halting:
                     # L2 norm over model dimension
@@ -581,11 +671,42 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 z = z_next
             
             # Predict the next token from final state
-            logits = self.output(self.state_norm(z)) / max(temperature, 1e-6)
+            logits = self.output(self.state_norm(z))
             
+            # 4. Apply Repetition Penalty to prevent coordinate collapse loops
+            repetition_penalty = 1.15
+            if repetition_penalty != 1.0:
+                logits = logits.clone()
+                for batch_idx in range(generated.size(0)):
+                    token_ids = torch.unique(generated[batch_idx])
+                    token_logits = logits[batch_idx, token_ids]
+                    logits[batch_idx, token_ids] = torch.where(
+                        token_logits < 0,
+                        token_logits * repetition_penalty,
+                        token_logits / repetition_penalty,
+                    )
+            
+            # Apply Temperature
+            logits = logits / max(temperature, 1e-6)
+            
+            # Apply Top-K filtering
             if top_k is not None:
                 values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
                 logits = logits.masked_fill(logits < values[:, [-1]], float("-inf"))
+                
+            # Apply Top-P (Nucleus) Filtering
+            top_p = 0.90
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                remove = cumulative > top_p
+                remove[..., 1:] = remove[..., :-1].clone()
+                remove[..., 0] = False
+                logits = logits.scatter(
+                    dim=-1,
+                    index=sorted_indices,
+                    src=sorted_logits.masked_fill(remove, float("-inf"))
+                )
                 
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
