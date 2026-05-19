@@ -369,7 +369,13 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     out = model(x, labels=y, gradient_checkpointing=args.gradient_checkpointing)
                 
-                loss = out["loss"] / args.grad_accum
+                loss = out["loss"]
+                # Add dynamic Ponder Loss to calibrate Halting Head automatically at any scale
+                if "ponder_loss" in out:
+                    ponder_weight = getattr(args, "ponder_weight", 0.05)
+                    loss = loss + ponder_weight * out["ponder_loss"]
+                
+                loss = loss / args.grad_accum
             
             scaler.scale(loss).backward()
             step_loss += float(out["loss"].detach())
@@ -574,6 +580,7 @@ def main():
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--fsdp", action="store_true", help="Enable Fully Sharded Data Parallel (FSDP)")
     parser.add_argument("--apply-sft-mask", action="store_true", default=True, help="Dynamically mask User prompts with -100 for Joint Ingestion")
+    parser.add_argument("--ponder-weight", type=float, default=0.05, help="Lambda weight for halting calibration penalty")
     parser.add_argument("--delete-consumed-shards", action="store_true", help="Delete consumed token cache shards to save disk space")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Number of learning rate warmup steps")
     parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum learning rate ratio relative to base lr")

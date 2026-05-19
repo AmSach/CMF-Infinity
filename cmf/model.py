@@ -550,42 +550,60 @@ class DeliberativeContinuousMeaningField(nn.Module):
             # High-performance grouped deliberation (95% faster autograd loop)
             def run_deliberation(z_val):
                 probs_list = []
+                ponder_losses = []
+                
+                # Enforce FP32 state accumulation to prevent scale-induced FP16 numerical drift 
+                # during long-horizon thinking orbits (critical for >1B param models).
+                z_accum = z_val.to(torch.float32)
+                
                 for step_idx in range(steps):
                     tau_value = (step_idx + 0.5) / float(steps)
                     tau = torch.full(
                         (batch_size * target_length,),
                         tau_value,
-                        dtype=z_val.dtype,
-                        device=z_val.device,
+                        dtype=z_accum.dtype,
+                        device=z_accum.device,
                     )
-                    flat_z = z_val.reshape(batch_size * target_length, -1)
-                    velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z_val)
-                    proposal = z_val + velocity / float(steps)
-                    gate_input = torch.cat([z_val, proposal, context], dim=-1)
-                    gate = torch.sigmoid(self.update_gate(gate_input))
-                    z_val = z_val + gate * (proposal - z_val)
                     
-                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_val)))
+                    # Convert down to optimal precision (FP16/BF16 via autocast) for heavy matrix math
+                    flat_z = z_accum.to(z_val.dtype).reshape(batch_size * target_length, -1)
+                    
+                    velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z_val)
+                    proposal = z_accum.to(z_val.dtype) + velocity / float(steps)
+                    gate_input = torch.cat([z_accum.to(z_val.dtype), proposal, context], dim=-1)
+                    gate = torch.sigmoid(self.update_gate(gate_input))
+                    
+                    # Core residual physics update strictly executed in FP32
+                    z_accum = z_accum + gate.to(torch.float32) * (proposal.to(torch.float32) - z_accum)
+                    
+                    # Ponder cost mechanism: penalize low halt probabilities at each step 
+                    # to strictly calibrate the halting head (solves over-thinking bottleneck)
+                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_accum.to(z_val.dtype))))
                     probs_list.append(halt_prob.mean())
-                return z_val, torch.stack(probs_list)
+                    ponder_losses.append((1.0 - halt_prob).mean())
+                    
+                return z_accum.to(z_val.dtype), torch.stack(probs_list), torch.stack(ponder_losses)
 
             actual_steps = steps
             if gradient_checkpointing:
-                z, halt_stack = torch.utils.checkpoint.checkpoint(
+                z, halt_stack, ponder_stack = torch.utils.checkpoint.checkpoint(
                     run_deliberation,
                     z,
                     use_reentrant=False
                 )
                 halt_means = list(halt_stack)
+                ponder_loss = ponder_stack.sum()
             else:
-                z, halt_stack = run_deliberation(z)
+                z, halt_stack, ponder_stack = run_deliberation(z)
                 halt_means = list(halt_stack)
+                ponder_loss = ponder_stack.sum()
 
         logits = self.output(self.state_norm(z))
         result: dict[str, torch.Tensor] = {
             "logits": logits,
             "thinking_steps": torch.tensor(actual_steps, device=z.device),
             "halt_mean": torch.stack(halt_means).mean() if halt_means else torch.tensor(0.0, device=z.device),
+            "ponder_loss": ponder_loss if not return_states else torch.tensor(0.0, device=z.device),
         }
         if labels is not None:
             result["loss"] = F.cross_entropy(
