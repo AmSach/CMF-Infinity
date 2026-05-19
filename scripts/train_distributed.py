@@ -104,8 +104,37 @@ def initialize_weights(model: torch.nn.Module, num_layers: int):
                 torch.nn.init.normal_(param, mean=0.0, std=0.02)
 
 def evaluate_math_reward(completion: str, target: str) -> float:
-    if not completion or not target: return -1.0
-    return 10.0 if target.strip() in completion.strip() else -2.0
+    if not completion or not target: return -2.0
+    
+    completion = completion.strip()
+    target = target.strip()
+    
+    # 1. Ultimate Goal: Correct Answer
+    if target in completion:
+        return 10.0
+        
+    # 2. Sparse Reward Problem Fix: Reward Shaping
+    # We give partial rewards to guide the model towards mathematical structure
+    reward = -2.0 # Base penalty for being wrong
+    
+    # Partial reward for at least outputting numbers instead of just punctuation
+    import re
+    if re.search(r'\d+', completion):
+        reward += 0.5
+        
+    # Partial reward for attempting to use mathematical operators
+    if re.search(r'[+\-*/=]', completion):
+        reward += 1.0
+        
+    # Partial reward for attempting reasoning words (SFT format mimicking)
+    if any(word in completion.lower() for word in ["step", "first", "then", "because", "equals"]):
+        reward += 1.5
+        
+    # Harsh penalty for degenerate loops (e.g., "::::::::::::::::::" or "3 3 3 3 3 3")
+    if len(completion) > 10 and len(set(completion)) < 4:
+        reward -= 3.0
+        
+    return reward
 
 def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
     """Executes a continuous self-play step, perfectly synchronized across all DDP ranks."""
