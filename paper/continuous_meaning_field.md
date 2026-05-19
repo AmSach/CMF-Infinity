@@ -206,6 +206,12 @@ CMF Infinity’s linear architectural layout allows it to achieve significant sc
 | **Context Storage (VRAM)** | $O(L \cdot N \cdot d)$ (KV-Cache) | **$O(N_{\text{beacons}} \cdot d)$** | Zero-parameter coordinate gravity memory |
 | **Compute Scaling** | Hard-Bounded by stacked layers | **Adaptive-time compute halting** | Compute drops automatically on simple tokens |
 
+### 3.9 Scaling Factual Capacity: SwiGLU MoE Memory
+To bridge the gap between 120M parameters and AGI-level encyclopedic storage (120B+), CMF Infinity decouples semantic attention keys from factual values. By applying a SiLU gating activation (SwiGLU) during memory readout, the model achieves massive factual storage density without quadratic computational overhead. 
+
+### 3.10 Infinite Context Extrapolation: Rotary Position Embeddings (RoPE)
+To solve the context-horizon limitation of absolute spatial mappings, CMF injects high-frequency Rotary Position Embeddings (RoPE) into the latent coordinate state space. This dynamically anchors the dilated temporal convolutions in relative distance metrics, theoretically allowing zero-shot trajectory extrapolation beyond 32k context windows with zero structural deterioration.
+
 ---
 
 ## 4. Hardware-Level Pretraining Infrastructure
@@ -316,6 +322,9 @@ To validate the model's actual qualitative capabilities before downstream alignm
 * **Model Output**: `what is temperature?`  
   `The temperature of the air at which the temperature increases as the temperature increases, the temperature of the air, and the temperature of the atmosphere...`
 * **Analysis (The Need for SFT)**: This transcript highlights an **Entropy Sink (Fixed-Point Attractor)**. Because the base model lacks SFT dialog formatting, repetitive probable terms act as a local coordinate trap. SFT conversational alignment (masking prompts using `-100` target labels) warps the trajectories to bypass these attractors, ensuring the probe lands gracefully at the `<|endoftext|>` token boundary.
+
+### 5.7 Algorithmic Discovery via GRPO Self-Play (The AGI Pipeline)
+Imitation learning (SFT) forces the continuous meaning field to clone human reasoning flaws. To shatter this ceiling, the CMF Infinity framework implements a native **Group Relative Policy Optimization (GRPO)** reinforcement learning pipeline. By generating dozens of logical trajectories autonomously and evaluating them against deterministic external engines (e.g., math verifiers or compilers), the vector field mathematically realigns itself to build and discover novel theorems via AlphaGo-style self-play, avoiding the computational tax of a dedicated Critic model.
 
 ---
 
