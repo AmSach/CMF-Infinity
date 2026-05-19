@@ -108,25 +108,52 @@ def evaluate_math_reward(completion: str, target: str) -> float:
     return 10.0 if target.strip() in completion.strip() else -2.0
 
 def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
-    """Executes a continuous self-play step, verifying logic without a Critic model."""
-    a, b = random.randint(1, 20), random.randint(1, 20)
-    prompt = f"User: Calculate {a} + {b} and explain the steps.\nAssistant:"
-    target_ans = str(a + b)
+    """Executes a continuous self-play step, perfectly synchronized across all DDP ranks."""
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     
-    input_ids = torch.tensor([enc.encode(prompt)], device=device)
+    # 1. Rank 0 generates the prompt and trajectory stochastically
+    if rank == 0:
+        a, b = random.randint(1, 20), random.randint(1, 20)
+        prompt = f"User: Calculate {a} + {b} and explain the steps.\nAssistant:"
+        target_ans = str(a + b)
+        
+        input_ids = torch.tensor([enc.encode(prompt)], device=device)
+        
+        # Generate trajectory outside of DDP sync bounds
+        model.eval()
+        with torch.no_grad():
+            if hasattr(model, "module"):
+                generated = model.module.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+            else:
+                generated = model.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+                
+        text_out = enc.decode(generated[0][input_ids.size(1):].tolist())
+        reward = evaluate_math_reward(text_out, target_ans)
+        
+        length = torch.tensor([generated.size(1)], dtype=torch.long, device=device)
+        reward_tensor = torch.tensor([reward], dtype=torch.float32, device=device)
+    else:
+        length = torch.tensor([0], dtype=torch.long, device=device)
+        reward_tensor = torch.tensor([0.0], dtype=torch.float32, device=device)
+        text_out = ""
+        target_ans = ""
+        
+    # 2. Broadcast sequence length to all ranks to allocate tensor
+    if world_size > 1:
+        dist.broadcast(length, src=0)
+        
+    if rank != 0:
+        generated = torch.zeros((1, length.item()), dtype=torch.long, device=device)
+        
+    # 3. Broadcast generated tokens and reward to all ranks identically
+    if world_size > 1:
+        dist.broadcast(generated, src=0)
+        dist.broadcast(reward_tensor, src=0)
+        
+    reward = reward_tensor.item()
     
-    # Generate trajectory outside of DDP sync bounds
-    model.eval()
-    with torch.no_grad():
-        if hasattr(model, "module"):
-            generated = model.module.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
-        else:
-            generated = model.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
-            
-    text_out = enc.decode(generated[0][input_ids.size(1):].tolist())
-    reward = evaluate_math_reward(text_out, target_ans)
-    
-    # We apply a small scalar advantage directly to the policy gradient
+    # We apply a small scalar advantage directly to the policy gradient, now identical on all ranks
     model.train()
     optimizer.zero_grad()
     
@@ -142,11 +169,6 @@ def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     scaler.update()
-    
-    if dist.is_initialized():
-        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
-        dist.all_reduce(reward_tensor, op=dist.ReduceOp.AVG)
-        reward = reward_tensor.item()
         
     return reward, text_out, target_ans
 
@@ -450,7 +472,7 @@ def train(args: argparse.Namespace) -> None:
         # --- JOINT AGI DISCOVERY: Interleaved GRPO Self-Play ---
         # Every 50 optimizer steps, the model generates its own math problem, 
         # verifies the logic, and backpropagates the discovery reward.
-        if step > 0 and (step // args.grad_accum) % 50 == 0:
+        if step > 0 and step % 50 == 0:
             try:
                 enc = tiktoken.get_encoding("gpt2")
                 rl_reward, rl_text, rl_target = run_grpo_self_play(model, enc, device, scaler, optimizer, args)
@@ -492,8 +514,8 @@ def train(args: argparse.Namespace) -> None:
                     print(f"   [Tokenizer Status] {latest_tok_line}")
 
 
-        # Save latest checkpoint according to args.save_every asynchronously (with FSDP collective synchronization to prevent deadlocks)
-        if (step + 1) % args.save_every == 0 and (is_master or is_fsdp):
+        # Save latest checkpoint according to args.save_every asynchronously (with collective synchronization to prevent deadlocks)
+        if (step + 1) % args.save_every == 0:
             checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt"
             temp_checkpoint_path = args.checkpoint_dir / "checkpoint_latest.pt.tmp"
             
@@ -509,7 +531,7 @@ def train(args: argparse.Namespace) -> None:
             if should_skip:
                 if is_master:
                     print(f"   [Checkpoint] Previous background save is still in progress, skipping save at step {step + 1} to prevent I/O bottlenecks.")
-            else:
+            elif is_master or is_fsdp:
                 if is_fsdp:
                     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
                     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
