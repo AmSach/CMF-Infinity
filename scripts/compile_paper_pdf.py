@@ -350,7 +350,7 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     
     @page {
         size: letter;
-        margin: 1in 1.5in 1in 1.5in;
+        margin: 1in 1.25in 1in 1.25in;
         background-color: #ffffff !important;
     }
     
@@ -382,82 +382,90 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
         background-color: #ffffff !important;
         background: #ffffff !important;
         color: #000000 !important;
-        line-height: 1.5;
-        font-size: 11pt;
+        line-height: 1.15;
+        font-size: 10pt;
         margin: 0;
         padding: 0;
     }
     
+    /* Limit figure height to prevent massive blank spacing */
+    img {
+        max-height: 2.2in !important;
+        max-width: 90% !important;
+        display: block;
+        margin: 10px auto;
+    }
+    
     .paper-header {
         text-align: center;
-        margin-bottom: 25px;
+        margin-bottom: 15px;
     }
     
     .paper-title {
-        font-size: 18pt;
-        margin-top: 15px;
-        margin-bottom: 10px;
-        line-height: 1.3;
+        font-size: 16pt;
+        margin-top: 10px;
+        margin-bottom: 8px;
+        line-height: 1.2;
         text-align: center;
     }
     
     .author-block {
-        margin-bottom: 20px;
-        line-height: 1.4;
+        margin-bottom: 15px;
+        line-height: 1.3;
         text-align: center;
     }
     
     .author-name {
-        font-size: 12pt;
+        font-size: 11pt;
         color: #000000 !important;
     }
     
     .abstract-box {
-        max-width: 90%;
-        margin: 20px auto 25px auto;
-        padding-top: 12px;
-        padding-bottom: 12px;
+        max-width: 95%;
+        margin: 15px auto 18px auto;
+        padding-top: 8px;
+        padding-bottom: 8px;
         border-top: 1.0px solid #000000 !important;
         border-bottom: 1.0px solid #000000 !important;
         text-align: justify;
     }
     
     .abstract-title {
-        font-size: 10pt;
+        font-size: 9.5pt;
         letter-spacing: 0.5px;
-        margin-bottom: 6px;
+        margin-bottom: 4px;
         color: #000000 !important;
         text-align: center;
     }
     
     .abstract-box p, .abstract-box li, .abstract-box ol, .abstract-box ul {
-        font-size: 10pt !important;
-        line-height: 1.4 !important;
+        font-size: 9pt !important;
+        line-height: 1.35 !important;
         color: #000000 !important;
         text-align: justify;
     }
     
     h2, h3, h4 {
         color: #000000 !important;
-        margin-top: 1.8em;
-        margin-bottom: 0.5em;
+        margin-top: 1.2em;
+        margin-bottom: 0.4em;
     }
     
     h2 {
-        font-size: 13pt;
+        font-size: 12pt;
         border-bottom: 1.0px solid #000000 !important;
-        padding-bottom: 3px;
+        padding-bottom: 2px;
     }
     
     h3 {
-        font-size: 11pt;
+        font-size: 10.5pt;
         border-bottom: 0.5px solid #666666 !important;
-        padding-bottom: 2px;
+        padding-bottom: 1px;
     }
     
     p {
         margin-top: 0;
-        margin-bottom: 1.0em;
+        margin-bottom: 0.6em;
         text-align: justify;
         text-justify: inter-word;
         color: #000000 !important;
@@ -469,48 +477,48 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     
     .equation {
         text-align: center;
-        margin: 15px 0;
-        font-size: 11pt;
+        margin: 10px 0;
+        font-size: 10pt;
         display: block;
         color: #000000 !important;
     }
     
     sup, sub {
-        font-size: 8pt !important;
+        font-size: 7.5pt !important;
         line-height: 0 !important;
     }
     
     pre {
         color: #000000 !important;
         border: 1px solid #cccccc !important;
-        padding: 8px;
+        padding: 6px;
         background-color: #fcfcfc !important;
         white-space: pre-wrap !important;
         word-wrap: break-word !important;
-        font-size: 9pt !important;
+        font-size: 8.5pt !important;
         font-family: 'Fira Code', Courier, monospace !important;
-        margin-top: 1em;
-        margin-bottom: 1em;
+        margin-top: 0.6em;
+        margin-bottom: 0.6em;
     }
     
     code {
         font-family: 'Fira Code', Courier, monospace !important;
-        font-size: 9.5pt !important;
+        font-size: 8.5pt !important;
         color: #000000 !important;
     }
     
     table {
         width: 100%;
         border-collapse: collapse;
-        margin: 1.5em 0;
-        font-size: 9.5pt;
-        border-top: 1.5px solid #000000 !important;
-        border-bottom: 1.5px solid #000000 !important;
+        margin: 1.0em 0;
+        font-size: 9pt;
+        border-top: 1.2px solid #000000 !important;
+        border-bottom: 1.2px solid #000000 !important;
     }
     
     th, td {
         border: none !important;
-        padding: 6px 10px;
+        padding: 5px 8px;
         text-align: left;
         color: #000000 !important;
     }
@@ -530,19 +538,19 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     
     ul, ol {
         margin-top: 0;
-        margin-bottom: 1.0em;
-        padding-left: 20px;
+        margin-bottom: 0.8em;
+        padding-left: 18px;
     }
     
     li {
-        margin-bottom: 0.4em;
+        margin-bottom: 0.25em;
         color: #000000 !important;
     }
     
     hr {
         border: 0;
         border-top: 1.0px solid #000000 !important;
-        margin: 2em 0;
+        margin: 1.5em 0;
     }
     """
     
