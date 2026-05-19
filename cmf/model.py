@@ -349,13 +349,29 @@ class ParallelContinuousMeaningField(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = DilatedContextEncoder(config)
+        self.encoder = UpgradedContextEncoder(config)
         self.initial_state = nn.Linear(config.d_model, config.d_model)
         self.field = VectorField(config)
         self.state_norm = nn.LayerNorm(config.d_model)
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.output.weight = self.embedding.weight
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("encoder.blocks."):
+                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
+                mapped_state_dict[new_key] = v
+            elif k == "field.memory":
+                mapped_state_dict["field.memory_bank.memory"] = v
+                mapped_state_dict["field.memory"] = v
+            else:
+                mapped_state_dict[k] = v
+        # Allow GMR router parameter omissions when loading old checkpoints
+        if getattr(self.config, "use_global_memory_router", False):
+            return super().load_state_dict(mapped_state_dict, strict=False)
+        return super().load_state_dict(mapped_state_dict, strict=strict)
 
     def forward(
         self,
@@ -726,7 +742,7 @@ class FastParallelContinuousMeaningField(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = DilatedContextEncoder(config)
+        self.encoder = UpgradedContextEncoder(config)
         self.initial_state = nn.Linear(config.d_model, config.d_model)
         
         # Memory and Goal support
@@ -739,6 +755,19 @@ class FastParallelContinuousMeaningField(nn.Module):
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.output.weight = self.embedding.weight
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("encoder.blocks."):
+                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
+                mapped_state_dict[new_key] = v
+            else:
+                mapped_state_dict[k] = v
+        # Allow GMR router parameter omissions when loading old checkpoints
+        if getattr(self.config, "use_global_memory_router", False):
+            return super().load_state_dict(mapped_state_dict, strict=False)
+        return super().load_state_dict(mapped_state_dict, strict=strict)
 
     def forward(
         self,

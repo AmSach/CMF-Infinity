@@ -21,6 +21,8 @@ echo ======================================================================
 
 .\.venv\Scripts\python.exe -u scripts\run_rtx4050_chinchilla.py ^
   --phase train ^
+  --preset infinity-reasoning-0.12b ^
+  --no-init-package ^
   --target-tokens 100000000 ^
   --data-dir records\data\chinchilla_gpt2_100m_snapshot ^
   --seq-len 128 ^
