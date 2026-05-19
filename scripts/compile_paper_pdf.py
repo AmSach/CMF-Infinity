@@ -297,33 +297,42 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     title_match = re.search(r"^# (.*?)$", processed_content, re.MULTILINE)
     title = title_match.group(1) if title_match else "Geodesics of Meaning"
     
+    # Double-blind check
+    is_neurips = "neurips" in pdf_path.name.lower()
+    
     # Extract Author & Affiliation
-    author_match = re.search(r"\*\*Aman Sachan\*\*\s*\n\*(.*?)\*\s*\n`(.*?)`", processed_content)
-    if author_match:
-        affiliation = author_match.group(1)
-        email = author_match.group(2)
+    if is_neurips:
+        author_name = "Anonymous Author(s)"
+        affiliation_block = "<i>Under Double-Blind Review</i>"
     else:
-        affiliation = "Independent Researcher"
-        email = "amansachan92905@gmail.com"
+        author_name = "Aman Sachan"
+        affiliation_block = ""
         
     # Extract Abstract text
-    abstract_match = re.search(r"### Abstract\n(.*?)(?=\n##|$)", processed_content, re.DOTALL)
+    abstract_match = re.search(r"#### Abstract\n(.*?)(?=\n##|$)", processed_content, re.DOTALL)
+    if not abstract_match:
+        abstract_match = re.search(r"### Abstract\n(.*?)(?=\n##|$)", processed_content, re.DOTALL)
     abstract_text = abstract_match.group(1).strip() if abstract_match else ""
     
     # Clean up original headers from the body so we can render them via custom structured HTML
     body_content = processed_content
     body_content = re.sub(r"^# .*?$", "", body_content, flags=re.MULTILINE)
     body_content = re.sub(r"\*\*Aman Sachan\*\*.*?\n`.*?`", "", body_content, flags=re.DOTALL)
+    body_content = re.sub(r"#### Abstract.*?(\n##|$)", "\\1", body_content, flags=re.DOTALL)
     body_content = re.sub(r"### Abstract.*?(\n##|$)", "\\1", body_content, flags=re.DOTALL)
     body_content = re.sub(r"^---\s*$", "", body_content, flags=re.MULTILINE) # remove top dividers
     
+    # Handle Image tag paths specifically if markdown processor expects absolute paths
+    # (Since we are rendering from memory string, relative image links might break)
+    image_base = f"file:///{str(md_path.parent).replace(chr(92), '/')}/"
+    body_content = re.sub(r"!\[(.*?)\]\((.*?\.png)\)", rf"![\1]({image_base}\2)", body_content)
+    
     # Reassemble with NeurIPS/ICML custom header/abstract block (CRITICAL: ZERO INDENTATION to avoid markdown code-block bug!)
-    # We wrap the abstract_text directly inside abstract-box with blank lines so the Markdown parser
-    # correctly parses all lists and inline formatting inside the abstract.
     html_header = f"""<div class="paper-header">
 <h1 class="paper-title">{title}</h1>
 <div class="author-block">
-<span class="author-name">Aman Sachan</span>
+<span class="author-name">{author_name}</span><br>
+<span class="author-affiliation" style="font-size: 10pt; color: #555;">{affiliation_block}</span>
 </div>
 <div class="abstract-box">
 <div class="abstract-title">Abstract</div>
