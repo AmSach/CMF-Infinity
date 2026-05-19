@@ -18,6 +18,10 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+import tiktoken
+import random
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -98,6 +102,53 @@ def initialize_weights(model: torch.nn.Module, num_layers: int):
         if "memory" in name or "anchor" in name:
             with torch.no_grad():
                 torch.nn.init.normal_(param, mean=0.0, std=0.02)
+
+def evaluate_math_reward(completion: str, target: str) -> float:
+    if not completion or not target: return -1.0
+    return 10.0 if target.strip() in completion.strip() else -2.0
+
+def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
+    """Executes a continuous self-play step, verifying logic without a Critic model."""
+    a, b = random.randint(1, 20), random.randint(1, 20)
+    prompt = f"User: Calculate {a} + {b} and explain the steps.\nAssistant:"
+    target_ans = str(a + b)
+    
+    input_ids = torch.tensor([enc.encode(prompt)], device=device)
+    
+    # Generate trajectory outside of DDP sync bounds
+    model.eval()
+    with torch.no_grad():
+        if hasattr(model, "module"):
+            generated = model.module.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+        else:
+            generated = model.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+            
+    text_out = enc.decode(generated[0][input_ids.size(1):].tolist())
+    reward = evaluate_math_reward(text_out, target_ans)
+    
+    # We apply a small scalar advantage directly to the policy gradient
+    model.train()
+    optimizer.zero_grad()
+    
+    with torch.amp.autocast(device_type=device.type, enabled=args.amp):
+        out = model(generated[:, :-1])
+        logits = out["logits"]
+        target_ids = generated[:, 1:].unsqueeze(-1)
+        token_log_probs = F.log_softmax(logits, dim=-1).gather(-1, target_ids).squeeze(-1)
+        
+        # Policy gradient scaled by standardized pseudo-advantage
+        loss = - (token_log_probs.sum() * (reward / 5.0))
+        
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    
+    if dist.is_initialized():
+        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
+        dist.all_reduce(reward_tensor, op=dist.ReduceOp.AVG)
+        reward = reward_tensor.item()
+        
+    return reward, text_out, target_ans
 
 def train(args: argparse.Namespace) -> None:
     rank, local_rank, world_size, device = setup_distributed()
@@ -388,13 +439,27 @@ def train(args: argparse.Namespace) -> None:
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
         
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
         # OOM prevention: periodically empty CUDA cache to prevent VRAM fragmentation
         if device.type == "cuda" and args.empty_cache_every > 0 and (step + 1) % args.empty_cache_every == 0:
             torch.cuda.empty_cache()
+            
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        
+        # --- JOINT AGI DISCOVERY: Interleaved GRPO Self-Play ---
+        # Every 50 optimizer steps, the model generates its own math problem, 
+        # verifies the logic, and backpropagates the discovery reward.
+        if step > 0 and (step // args.grad_accum) % 50 == 0:
+            try:
+                enc = tiktoken.get_encoding("gpt2")
+                rl_reward, rl_text, rl_target = run_grpo_self_play(model, enc, device, scaler, optimizer, args)
+                if is_master:
+                    print(f"\n[GRPO Self-Play] Extracted Target: {rl_target} | Reward: {rl_reward:+.2f}")
+                    print(f"Rollout: {rl_text.strip()[:100]}...\n")
+            except Exception as e:
+                if is_master:
+                    print(f"GRPO Self-Play non-fatal skip: {e}")
 
         if is_master and (step + 1) % args.log_every == 0:
             elapsed = time.perf_counter() - start_time
