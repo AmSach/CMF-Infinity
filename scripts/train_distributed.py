@@ -153,18 +153,32 @@ def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
         
     reward = reward_tensor.item()
     
+    # 4. Pad generated sequence to a fixed length to prevent torch.compile graph breaks!
+    MAX_GRPO_LEN = 64
+    actual_len = generated.size(1)
+    
+    if actual_len < MAX_GRPO_LEN:
+        pad_tensor = torch.full((1, MAX_GRPO_LEN - actual_len), 50256, dtype=torch.long, device=device)
+        generated_padded = torch.cat([generated, pad_tensor], dim=1)
+    else:
+        generated_padded = generated[:, :MAX_GRPO_LEN]
+        actual_len = MAX_GRPO_LEN
+        
+    mask = torch.zeros((1, MAX_GRPO_LEN - 1), dtype=torch.float32, device=device)
+    mask[0, :actual_len - 1] = 1.0
+    
     # We apply a small scalar advantage directly to the policy gradient, now identical on all ranks
     model.train()
     optimizer.zero_grad()
     
     with torch.amp.autocast(device_type=device.type, enabled=args.amp):
-        out = model(generated[:, :-1])
+        out = model(generated_padded[:, :-1])
         logits = out["logits"]
-        target_ids = generated[:, 1:].unsqueeze(-1)
+        target_ids = generated_padded[:, 1:].unsqueeze(-1)
         token_log_probs = F.log_softmax(logits, dim=-1).gather(-1, target_ids).squeeze(-1)
         
-        # Policy gradient scaled by standardized pseudo-advantage
-        loss = - (token_log_probs.sum() * (reward / 5.0))
+        # Policy gradient scaled by standardized pseudo-advantage, strictly masked to actual generated tokens
+        loss = - ((token_log_probs * mask).sum() * (reward / 5.0))
         
     scaler.scale(loss).backward()
     scaler.step(optimizer)
