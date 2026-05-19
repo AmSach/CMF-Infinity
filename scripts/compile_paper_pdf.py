@@ -185,9 +185,15 @@ def preprocess_math(text: str, output_dir: Path) -> str:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import shutil
     
-    # Create math images output directory
+    # Create math images output directory (force clear cache to update transparent backgrounds to solid white)
     img_dir = output_dir / "math_images"
+    if img_dir.exists():
+        try:
+            shutil.rmtree(img_dir)
+        except Exception:
+            pass
     img_dir.mkdir(parents=True, exist_ok=True)
     
     # Configure matplotlib for premium textbook Computer Modern serif math typography
@@ -214,7 +220,7 @@ def preprocess_math(text: str, output_dir: Path) -> str:
                 
         # Determine appropriate math canvas size and text size
         # We start with a large figure and crop tightly using bbox_inches='tight'
-        fig = plt.figure(figsize=(10, 4))
+        fig = plt.figure(figsize=(10, 4), facecolor='#ffffff')
         
         formula = eq_text
         if not formula.startswith('$'):
@@ -225,11 +231,12 @@ def preprocess_math(text: str, output_dir: Path) -> str:
         # Render the equation
         fig.text(0.5, 0.5, formula, fontsize=fontsize, ha='center', va='center', color='#111111')
         
-        # Save high-resolution transparent PNG
+        # Save high-resolution PNG with solid white background to avoid dark black boxes in PDF viewers
         fig.savefig(
             filepath,
             dpi=300,
-            transparent=True,
+            transparent=False,
+            facecolor='#ffffff',
             bbox_inches='tight',
             pad_inches=0.015 if is_block else 0.005
         )
@@ -275,17 +282,11 @@ def preprocess_math(text: str, output_dir: Path) -> str:
     processed = re.sub(r"\$([^$]+)\$", replace_inline_math, processed)
     return processed
 
-def compile_paper():
-    print("Starting CMF Research Paper PDF compilation with dynamic math processor...")
-    
-    workspace_dir = Path(__file__).resolve().parent.parent
-    md_path = workspace_dir / "paper" / "continuous_meaning_field.md"
-    pdf_path = workspace_dir / "paper" / "continuous_meaning_field.pdf"
-    
+def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     if not md_path.exists():
-        print(f"Error: Paper markdown not found at {md_path}")
         return
         
+    print(f"Compiling {md_path.name} -> {pdf_path.name}...")
     with open(md_path, "r", encoding="utf-8") as f:
         md_content = f.read()
         
@@ -326,9 +327,9 @@ def compile_paper():
 </div>
 <div class="abstract-box">
 <div class="abstract-title">Abstract</div>
-
+ 
 {abstract_text}
-
+ 
 </div>
 </div>"""
     
@@ -339,14 +340,12 @@ def compile_paper():
     @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&display=swap');
     
     @page {
-        size: A4;
-        margin: 15mm 15mm 15mm 15mm;
-        background-color: #faf8f5 !important;
+        size: letter;
+        margin: 1in 1.5in 1in 1.5in;
+        background-color: #ffffff !important;
     }
     
-    /* Strict Black & White, No-Background Stylesheet to prevent PyMuPDF/weasyprint container rectangle overlaps */
-    
-    /* Force all layout and textual elements to be transparent by default, excluding html/body */
+    /* Strict White Background Stylesheet to prevent dark box artifacts */
     * {
         box-shadow: none !important;
         text-shadow: none !important;
@@ -357,297 +356,163 @@ def compile_paper():
         background: transparent !important;
     }
     
-    /* Explicitly define body background as soft off-white and text as warm off-black */
+    /* Academic Serif Typography matching standard LaTeX Computer Modern / Times */
     html, body, p, span, blockquote, pre, code, ul, ol, li, h1, h2, h3, h4, h5, h6, table, tr, th, td {
-        font-family: Helvetica, Arial, sans-serif !important;
+        font-family: Georgia, 'Times New Roman', Times, serif !important;
     }
     
     p, li, blockquote, td, ol, ul, .abstract-box p {
-        font-weight: 600 !important;
+        font-weight: normal !important;
     }
     
     h1, h2, h3, h4, h5, h6, .paper-title, .abstract-title, .author-name {
-        font-weight: 800 !important;
+        font-weight: bold !important;
     }
     
     html, body {
-        background-color: #faf8f5 !important;
-        background: #faf8f5 !important;
-        color: #111111 !important;
-        line-height: 1.65;
-        font-size: 10.5pt;
+        background-color: #ffffff !important;
+        background: #ffffff !important;
+        color: #000000 !important;
+        line-height: 1.5;
+        font-size: 11pt;
         margin: 0;
         padding: 0;
     }
     
     .paper-header {
         text-align: center;
-        margin-bottom: 30px;
+        margin-bottom: 25px;
     }
     
     .paper-title {
-        font-family: Helvetica, Arial, sans-serif !important;
-        font-size: 22pt;
-        font-weight: 700;
-        color: #111111 !important;
-        margin-top: 20px;
-        margin-bottom: 15px;
-        line-height: 1.25;
+        font-size: 18pt;
+        margin-top: 15px;
+        margin-bottom: 10px;
+        line-height: 1.3;
         text-align: center;
     }
     
     .author-block {
-        margin-bottom: 25px;
-        line-height: 1.5;
+        margin-bottom: 20px;
+        line-height: 1.4;
         text-align: center;
     }
     
     .author-name {
-        font-family: Helvetica, Arial, sans-serif !important;
-        font-size: 12.5pt;
-        font-weight: 600;
-        color: #111111 !important;
-    }
-    
-    .author-affiliation {
-        font-size: 10pt;
-        color: #111111 !important;
-        font-style: italic;
-    }
-    
-    .author-email {
-        font-size: 9pt;
-        color: #111111 !important;
+        font-size: 12pt;
+        color: #000000 !important;
     }
     
     .abstract-box {
-        max-width: 85%;
-        margin: 25px auto 30px auto;
-        padding-top: 15px;
-        padding-bottom: 15px;
-        border-top: 1.5px solid #111111 !important;
-        border-bottom: 1.5px solid #111111 !important;
+        max-width: 90%;
+        margin: 20px auto 25px auto;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        border-top: 1.0px solid #000000 !important;
+        border-bottom: 1.0px solid #000000 !important;
         text-align: justify;
     }
     
     .abstract-title {
-        font-family: Helvetica, Arial, sans-serif !important;
         font-size: 10pt;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        margin-bottom: 8px;
-        color: #111111 !important;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+        color: #000000 !important;
         text-align: center;
     }
     
-    /* Ensure all elements inside the abstract inherit uniform academic font styles */
     .abstract-box p, .abstract-box li, .abstract-box ol, .abstract-box ul {
-        font-family: Helvetica, Arial, sans-serif !important;
-        font-size: 9.5pt !important;
-        line-height: 1.5 !important;
-        color: #111111 !important;
+        font-size: 10pt !important;
+        line-height: 1.4 !important;
+        color: #000000 !important;
         text-align: justify;
     }
     
-    .abstract-box li {
-        margin-bottom: 0.4em;
-    }
-    
     h2, h3, h4 {
-        font-family: Helvetica, Arial, sans-serif !important;
-        color: #111111 !important;
-        font-weight: 700;
-        margin-top: 2em;
-        margin-bottom: 0.6em;
+        color: #000000 !important;
+        margin-top: 1.8em;
+        margin-bottom: 0.5em;
     }
     
     h2 {
-        font-size: 13.5pt;
-        border-bottom: 1.5px solid #111111 !important;
-        padding-bottom: 4px;
-        margin-top: 2.2em;
+        font-size: 13pt;
+        border-bottom: 1.0px solid #000000 !important;
+        padding-bottom: 3px;
     }
     
     h3 {
-        font-size: 11.5pt;
-        border-bottom: 1px solid #111111 !important;
+        font-size: 11pt;
+        border-bottom: 0.5px solid #666666 !important;
         padding-bottom: 2px;
     }
     
     p {
         margin-top: 0;
-        margin-bottom: 1.2em;
+        margin-bottom: 1.0em;
         text-align: justify;
         text-justify: inter-word;
-        color: #111111 !important;
+        color: #000000 !important;
     }
     
-    /* Mathematical Equation Styling */
     .equation, .inline-equation {
         font-family: 'Times New Roman', Times, serif !important;
     }
     
-    .inline-equation {
-        font-style: italic;
-        padding: 0 1px;
-    }
-    
-    .inline-equation .fraction {
-        font-size: 85%;
-    }
-    
     .equation {
         text-align: center;
-        margin: 20px 0;
+        margin: 15px 0;
         font-size: 11pt;
-        line-height: 2.0;
         display: block;
-        color: #111111 !important;
-    }
-    
-    .math-fraction {
-        display: inline !important;
-        font-family: 'Times New Roman', Times, serif !important;
-    }
-    
-    .math-fraction sup {
-        font-weight: bold !important;
-    }
-    
-    .math-fraction sub {
-        font-weight: bold !important;
-    }
-    
-    .sqrt {
-        display: inline-flex;
-        align-items: center;
-        vertical-align: middle;
-    }
-    
-    .sqrt .symbol {
-        font-size: 13pt;
-        margin-right: 1px;
-        font-family: Helvetica, Arial, sans-serif !important;
-    }
-    
-    .sqrt .expr {
-        border-top: 1px solid #111111 !important;
-        padding-top: 1px;
-    }
-    
-    .math-integral {
-        display: inline !important;
-        font-family: 'Times New Roman', Times, serif !important;
-        font-size: 15pt !important;
-        vertical-align: middle !important;
-    }
-    
-    .math-integral sub {
-        font-weight: bold !important;
-    }
-    
-    .math-integral sup {
-        font-weight: bold !important;
-    }
-    
-    .math-bf {
-        font-weight: bold;
-        font-style: normal;
-    }
-    
-    .math-text, .math-rm {
-        font-style: normal;
-        font-family: Helvetica, Arial, sans-serif !important;
+        color: #000000 !important;
     }
     
     sup, sub {
-        font-size: 7.5pt !important;
+        font-size: 8pt !important;
         line-height: 0 !important;
     }
     
-    sup {
-        vertical-align: super !important;
-    }
-    
-    sub {
-        vertical-align: sub !important;
+    pre {
+        color: #000000 !important;
+        border: 1px solid #cccccc !important;
+        padding: 8px;
+        background-color: #fcfcfc !important;
+        white-space: pre-wrap !important;
+        word-wrap: break-word !important;
+        font-size: 9pt !important;
+        font-family: 'Fira Code', Courier, monospace !important;
+        margin-top: 1em;
+        margin-bottom: 1em;
     }
     
     code {
-        font-family: Helvetica, Arial, sans-serif !important;
-        font-size: 10.5pt !important;
-        color: #111111 !important;
-        padding: 0px 2px;
+        font-family: 'Fira Code', Courier, monospace !important;
+        font-size: 9.5pt !important;
+        color: #000000 !important;
     }
     
-    /* Code blocks use simple thin solid border, no colored background, reduced font size to prevent A4 paper overflow */
-    pre {
-        color: #111111 !important;
-        border: 1px solid #111111 !important;
-        padding: 10px;
-        border-radius: 0px !important;
-        white-space: pre-wrap !important;
-        word-wrap: break-word !important;
-        word-break: break-all !important;
-        margin-top: 1em;
-        margin-bottom: 1.5em;
-        font-size: 7.5pt !important;
-    }
-    
-    pre code {
-        color: #111111 !important;
-        font-size: 7.5pt !important;
-        font-family: 'Courier New', Courier, monospace !important;
-    }
-    
-    sub {
-        vertical-align: sub !important;
-        font-size: 7.5pt !important;
-        line-height: 0 !important;
-    }
-    
-    sup {
-        vertical-align: super !important;
-        font-size: 7.5pt !important;
-        line-height: 0 !important;
-    }
-    
-    /* Blockquotes use classic black left line with zero background color */
-    blockquote {
-        margin: 1.5em 0;
-        padding: 10px 20px;
-        border-left: 3px solid #111111 !important;
-        color: #111111 !important;
-        font-style: italic;
-    }
-    
-    /* booktabs table: pure black rules, no vertical lines, no backgrounds */
     table {
         width: 100%;
         border-collapse: collapse;
-        margin: 2em 0;
+        margin: 1.5em 0;
         font-size: 9.5pt;
-        border-top: 2px solid #111111 !important;
-        border-bottom: 2px solid #111111 !important;
+        border-top: 1.5px solid #000000 !important;
+        border-bottom: 1.5px solid #000000 !important;
     }
     
     th, td {
         border: none !important;
-        padding: 8px 12px;
+        padding: 6px 10px;
         text-align: left;
-        color: #111111 !important;
+        color: #000000 !important;
     }
     
     th {
-        font-family: Helvetica, Arial, sans-serif !important;
-        font-weight: 700;
-        color: #111111 !important;
-        border-bottom: 1.5px solid #111111 !important;
+        font-weight: bold;
+        border-bottom: 1.0px solid #000000 !important;
     }
     
     td {
-        border-bottom: 1px solid #cbd5e1 !important;
+        border-bottom: 0.5px solid #e2e8f0 !important;
     }
     
     tr:last-child td {
@@ -656,19 +521,19 @@ def compile_paper():
     
     ul, ol {
         margin-top: 0;
-        margin-bottom: 1.2em;
+        margin-bottom: 1.0em;
         padding-left: 20px;
     }
     
     li {
-        margin-bottom: 0.5em;
-        color: #111111 !important;
+        margin-bottom: 0.4em;
+        color: #000000 !important;
     }
     
     hr {
         border: 0;
-        border-top: 1.5px solid #111111 !important;
-        margin: 2.5em 0;
+        border-top: 1.0px solid #000000 !important;
+        margin: 2em 0;
     }
     """
     
@@ -679,9 +544,9 @@ def compile_paper():
     print(f"Saving compiled paper PDF to temporary path {temp_path}...")
     pdf.save(str(temp_path))
     
-    # Post-processing: Re-open the compiled PDF to paint the off-white background (#faf8f5) on the canvas behind the text
+    # Post-processing: Paint white background (#ffffff)
     doc = fitz.open(temp_path)
-    bg_color = (250 / 255.0, 248 / 255.0, 245 / 255.0)
+    bg_color = (1.0, 1.0, 1.0)
     for page in doc:
         page.wrap_contents()
         page.draw_rect(page.rect, color=bg_color, fill=bg_color, overlay=False)
@@ -693,7 +558,24 @@ def compile_paper():
     if temp_path.exists():
         os.remove(temp_path)
     
-    print("Success! CMF Research Paper PDF successfully compiled.")
+    print(f"Success! {pdf_path.name} successfully compiled.")
+
+def compile_paper():
+    print("Starting CMF Research Paper PDF compilation with dynamic math processor...")
+    workspace_dir = Path(__file__).resolve().parent.parent
+    
+    # Compile both versions if they exist
+    compile_file(
+        workspace_dir / "paper" / "continuous_meaning_field.md",
+        workspace_dir / "paper" / "continuous_meaning_field.pdf",
+        workspace_dir
+    )
+    
+    compile_file(
+        workspace_dir / "paper" / "continuous_meaning_field_neurips.md",
+        workspace_dir / "paper" / "continuous_meaning_field_neurips.pdf",
+        workspace_dir
+    )
 
 if __name__ == "__main__":
     compile_paper()

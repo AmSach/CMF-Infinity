@@ -25,3 +25,7 @@ test_*.png
 test_*.pdf
 /paper/test_*.pdf
 /paper/test_*.png
+
+# NeurIPS submission drafts (confidential)
+paper/*_neurips.md
+paper/*_neurips.pdf
