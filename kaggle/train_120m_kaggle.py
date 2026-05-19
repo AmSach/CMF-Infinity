@@ -207,7 +207,7 @@ def main():
         "--empty-cache-every", "100",
  
         "--seq-len", "512",
-        "--steps", "15000", # Complete cosine decay exactly at step 15,000 for ultimate quality
+        "--steps", "25000", # Complete cosine decay exactly at step 25,000 for ultimate quality
         "--amp",
         "--tf32",
         "--gradient-checkpointing",

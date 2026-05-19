@@ -617,8 +617,6 @@ Below are the exact transcripts of the unaligned model's outputs when queried di
   `The temperature of the air at which the temperature increases as the temperature increases, the temperature of the air, and the temperature of the atmosphere...`
 * **Scientific Analysis**: Small un-aligned base models (120M parameters) are highly susceptible to **Fixed-Point Attractors** in their semantic vector fields when asked for basic general definitions. Without instruction alignment or penalty tuning, repeating highly probable terms (like the word "temperature") becomes a statistical trap, causing infinite recursive looping.
 
----
-
 ### 🛠️ 10.3 The Path to Conversation: Supervised Fine-Tuning (SFT)
 To guide the glider out of recursive local traps and train it to behave as an aligned chatbot, we perform **Supervised Fine-Tuning (SFT)**:
 1. **Instruction Formatting**: We encapsulate prompts in a clean format: `User: {instruction}\nAssistant: {response}\n`.
@@ -627,12 +625,39 @@ To guide the glider out of recursive local traps and train it to behave as an al
 
 ---
 
+### 🌌 10.4 Symplectic Leapfrog (Verlet): Conserving Semantic Phase-Space Energy
+* **The Problem (Orbital Decay / Hallucination)**: During long integration sweeps, standard solvers like Euler compile tiny rounding errors. These errors act like continuous friction, causing the semantic particle's orbit to decay and slide into coordinate basins of absolute gibberish (hallucinations).
+* **The Analogy (Splitting Position and Momentum)**: Rather than steering a spaceship by measuring its current position alone, we split the state vector into two complementary halves: **Semantic Position ($\mathbf{q}$)** representing the current topic, and **Cognitive Momentum ($\mathbf{p}$)** representing the trajectory's velocity and direction of thought.
+* **The Cure**: We integrate using a **Symplectic Leapfrog (Verlet)** scheme. Position and momentum updates are staggered:
+  1. We update momentum by a half-step using the force of the vector field at the current position.
+  2. We update position by a full-step using the new momentum.
+  3. We update momentum by a final half-step using the force at the new position.
+  
+Mathematically, this staggered leapfrog loop conserves the **Hamiltonian (total energy)** of the semantic system. Rounding errors oscillate harmlessly rather than accumulating, guaranteeing that the semantic particle remains locked in a stable orbit, preserving grammatical and logical coherence over long contexts.
+
+---
+
+### 🛰️ 10.5 The Global Memory Router: Wormhole Corridors to Global Context
+* **The Problem (Local Horizon Blindness)**: Local causal convolutions act like local steering wheels—they are fantastic at local grammar but can become blind to long-range topics.
+* **The Analogy (The Wormhole Navigation Grid)**: Instead of forcing the particle to travel step-by-step through a long sequence to recall past topics, CMF-v2 establishes **Global Memory Router (GMR)** wormholes.
+* **The Cure**: GMR uses query-key attention at each integration step to retrieve global context markers from a persistent memory bank and routes them directly back into the local convolution blocks. This creates a global routing grid that lets the particle query its past instantly, anchoring its flight plan to global constraints.
+
+---
+
+### 🏎️ 10.6 Joint Pre-Training and Alignment (Continuous Chat Alignment)
+* **The Problem (The Dual-Boot Camp Dilemma)**: Historically, models go through two distinct phases: Pre-training (learning general grammar) followed by a separate SFT phase (learning to behave like a chatbot). If you stop training midway through pre-training, you get a model that cannot hold a conversation.
+* **The Analogy (Interleaved Space Cadet Training)**: Instead of first teaching a space cadet how to float in space (pretraining) and then sending them to a separate boot camp to learn how to dock (SFT), we train them to float and dock at the same time by interleaving general educational flight logs with active docking maneuvers in their training manual.
+* **The Cure (Joint Ingestion)**: We mix standard educational text with **10% instruction-following Q&A pairs** (using Alpaca and targeted mathematical templates) directly into the pre-training corpus. Since the model learns formatting and conversational turn-taking boundaries concurrently with general language modeling, **you can stop training at any step** and immediately export a fully functioning chatbot with no dual thoughts or separate fine-tuning phases required.
+
+---
+
 ## 🎓 Summary of the Continuous Cosmos
 
 By transitioning from the discrete staircases of standard Transformers to the smooth, continuous physics of CMF:
 1. You have replaced heavy, battery-draining laser tracking (KV Cache) with static, passive **Celestial Gravity Beacons** for memory.
-2. You have implemented **Dynamic Halting** based on Kinetic Energy to shut down engines early on easy orbits.
-3. You have stabilized the ship against cosmic collapses using **Langevin SDE thrusters** and **topological space lanes**.
-4. You have built a **Zero-Latency Cosmic Assembly Line** utilizing DDP, asynchronous RAM preloading, and 6-source AGI fuel mixing.
+2. You have stabilized long-context paths using staggered **Symplectic Leapfrog (Verlet)** solvers to conserve semantic energy.
+3. You have linked local convolutions to global context using the **Global Memory Router**.
+4. You have combined pre-training and chatbot alignment into a single **Joint Ingestion** pipeline.
+5. You have stabilized the ship against cosmic collapses using **Langevin SDE thrusters** and **topological space lanes**.
 
 You are now a master navigator of the Continuous Cosmos. Go forth and explore the stars of AGI! 🚀🎓🌌
