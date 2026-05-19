@@ -96,19 +96,18 @@ def cleanup_disk_space():
     print("--- [Space Saver Auto-Pilot] Scan complete. Output storage is optimized. ---\n")
 
 def auto_import_weights():
-    checkpoint_path = ROOT / "checkpoint_latest.pt"
+    repo_checkpoint = ROOT / "checkpoint_latest.pt"
     print("\n--- [Git LFS Auto-Import] Checking checkpoint weights... ---")
     
     needs_pull = False
-    if not checkpoint_path.exists():
-        print("checkpoint_latest.pt does not exist locally. Will trigger Git LFS pull.")
+    if not repo_checkpoint.exists():
+        print("checkpoint_latest.pt does not exist locally in repo. Will trigger Git LFS pull.")
         needs_pull = True
-    elif checkpoint_path.stat().st_size < 1000:
-        print("Found checkpoint_latest.pt but it appears to be a Git LFS pointer file (< 1KB).")
+    elif repo_checkpoint.stat().st_size < 1000:
+        print("Found checkpoint_latest.pt in repo but it appears to be a Git LFS pointer file (< 1KB).")
         needs_pull = True
     else:
-        print(f"Verified checkpoint_latest.pt is present and valid ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
-        return
+        print(f"Verified repo checkpoint_latest.pt is present and valid ({repo_checkpoint.stat().st_size / (1024*1024):.2f} MB).")
         
     if needs_pull:
         print("Running 'git lfs install' and 'git lfs pull' to download the 612MB weights file...")
@@ -116,8 +115,8 @@ def auto_import_weights():
             subprocess.run(["git", "lfs", "install"], check=True, cwd=str(ROOT))
             subprocess.run(["git", "lfs", "pull"], check=True, cwd=str(ROOT))
             
-            if checkpoint_path.exists() and checkpoint_path.stat().st_size >= 1000:
-                print(f"Success! Downloaded checkpoint_latest.pt ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
+            if repo_checkpoint.exists() and repo_checkpoint.stat().st_size >= 1000:
+                print(f"Success! Downloaded checkpoint_latest.pt ({repo_checkpoint.stat().st_size / (1024*1024):.2f} MB).")
             else:
                 print("Warning: git lfs pull executed but checkpoint_latest.pt is still missing or a pointer.")
         except Exception as e:
@@ -128,11 +127,24 @@ def auto_import_weights():
                 subprocess.run(["apt-get", "install", "-y", "git-lfs"], check=True)
                 subprocess.run(["git", "lfs", "install"], check=True, cwd=str(ROOT))
                 subprocess.run(["git", "lfs", "pull"], check=True, cwd=str(ROOT))
-                if checkpoint_path.exists() and checkpoint_path.stat().st_size >= 1000:
-                    print(f"Success after apt-get! checkpoint_latest.pt downloaded ({checkpoint_path.stat().st_size / (1024*1024):.2f} MB).")
+                if repo_checkpoint.exists() and repo_checkpoint.stat().st_size >= 1000:
+                    print(f"Success after apt-get! checkpoint_latest.pt downloaded ({repo_checkpoint.stat().st_size / (1024*1024):.2f} MB).")
             except Exception as apt_err:
                 print(f"Could not install git-lfs via apt-get: {apt_err}")
                 print("Please download the weights manually or configure Git LFS in your environment.")
+
+    # Replicate/Copy to /kaggle/working if on Kaggle and target does not exist yet
+    target_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else ROOT
+    target_checkpoint = target_dir / "checkpoint_latest.pt"
+    
+    if target_dir != ROOT and repo_checkpoint.exists() and repo_checkpoint.stat().st_size >= 1000:
+        if not target_checkpoint.exists():
+            try:
+                import shutil
+                shutil.copy2(str(repo_checkpoint), str(target_checkpoint))
+                print(f"Successfully copied imported LFS checkpoint to target directory: {target_checkpoint}")
+            except Exception as copy_err:
+                print(f"Warning: Failed to copy LFS checkpoint to target directory: {copy_err}")
 
 def main():
     import argparse
@@ -152,7 +164,8 @@ def main():
     run([sys.executable, "-m", "pip", "install", "ninja"])
 
     # 2. Parallel Tokenization (Fast Path)
-    data_dir = ROOT / "records" / "data" / "cmf_hybrid_agi_mixed_v2"
+    global_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else ROOT
+    data_dir = global_dir / "records" / "data" / "cmf_hybrid_agi_mixed_v2"
     target_tokens = 200_000_000_000 # 200 Billion tokens for absolute hyper-saturation of the 120M model weights
     
     # Kill any zombie tokenizer processes from aborted runs to prevent file locks/contention
@@ -172,7 +185,7 @@ def main():
             print(f"\n--- Preparing {target_tokens:,} tokens using Parallel Interleaved Mixer (BACKGROUND PROCESS) ---\n")
         
         # Launch tokenization as a background process redirecting stdout/stderr to a dedicated log file
-        log_file = ROOT / "records" / "tokenizer_output.log"
+        log_file = global_dir / "records" / "tokenizer_output.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_handle = open(log_file, "w", encoding="utf-8")
         
