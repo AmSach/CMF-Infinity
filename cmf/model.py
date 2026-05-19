@@ -225,7 +225,7 @@ class FactualMemoryBank(nn.Module):
         self.memory = nn.Parameter(torch.randn(num_anchors, d_model))
         # High-capacity factual Value space
         self.values = nn.Parameter(torch.randn(num_anchors, d_model * 2))
-        self.gate = nn.Linear(d_model * 2, d_model)
+        self.gate = nn.Linear(d_model, d_model)
         
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         attn_weights = torch.softmax(torch.matmul(z, self.memory.T) / math.sqrt(z.size(-1)), dim=-1)
