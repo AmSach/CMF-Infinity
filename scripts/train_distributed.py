@@ -520,7 +520,7 @@ def train(args: argparse.Namespace) -> None:
         # --- JOINT AGI DISCOVERY: Interleaved GRPO Self-Play ---
         # Every 20 optimizer steps, the model generates its own math problem, 
         # verifies the logic, and backpropagates the discovery reward.
-        if step > 0 and step % 20 == 0:
+        if False: # DISABLED FOR PHASE 1: Let the model master language modeling first.
             try:
                 enc = tiktoken.get_encoding("gpt2")
                 rl_reward, rl_text, rl_target = run_grpo_self_play(model, enc, device, scaler, optimizer, args)
