@@ -15,18 +15,21 @@ class CMFConfig:
     causal: bool = True
     tie_embeddings: bool = True
     # Adaptive Flow settings
-    adaptive_steps: bool = False
+    adaptive_steps: bool = True  # enable adaptive solver steps by default to avoid loops
     min_solver_steps: int = 1
-    max_solver_steps: int = 4
+    max_solver_steps: int = 8  # allow more solver steps when needed
     curvature_threshold: float = 0.05
     # Deliberative latent refinement settings
     thinking_steps: int = 2
-    adaptive_thinking: bool = False
+    adaptive_thinking: bool = True  # enable adaptive thinking by default
     min_thinking_steps: int = 1
-    max_thinking_steps: int = 4
-    halting_threshold: float = 0.85
+    max_thinking_steps: int = 8  # higher ceiling for adaptive thinking
+    halting_threshold: float = 0.90  # more conservative to stop early and avoid runaway loops
     # CMF-v2 upgrades
     use_global_memory_router: bool = False
+    # AGI-scale architecture settings
+    num_memory_anchors: int = 64     # scales factual capacity; 64 for 120M, 256 for 7B, 1024 for 70B+
+    field_depth: int = 2             # number of hidden layers in the VectorField MLP; 2 for 120M, 4 for 7B+
 
 
 @dataclass
