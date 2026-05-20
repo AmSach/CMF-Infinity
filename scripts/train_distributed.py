@@ -130,8 +130,10 @@ def evaluate_math_reward(completion: str, target: str) -> float:
     if any(word in completion.lower() for word in ["step", "first", "then", "because", "equals"]):
         reward += 1.5
         
-    # Harsh penalty for degenerate loops (e.g., "::::::::::::::::::" or "3 3 3 3 3 3")
+    # Harsh penalty for degenerate loops (e.g., ":::::::::" or "roletroletrolet")
     if len(completion) > 10 and len(set(completion)) < 4:
+        reward -= 3.0
+    elif re.search(r'(.{2,})\1{4,}', completion): # Catches repeating multi-char substrings
         reward -= 3.0
         
     return reward
