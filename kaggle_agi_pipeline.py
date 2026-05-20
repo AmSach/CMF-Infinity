@@ -192,15 +192,28 @@ def tokenization_worker():
         json.dump(manifest, f, indent=2)
     print(f"\n[Tokenizer] Finished. Total tokens: {tokens_seen:,}")
 
+def find_free_port():
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+    except Exception:
+        return random.randint(25000, 29999)
+
 def launch_training():
     print("=" * 60)
     print("2. Launching Concurrently Distributed Trainer")
     print("=" * 60)
     os.chdir(CMF_DIR)
 
+    port = find_free_port()
+    print(f"Using dynamically allocated master port: {port}")
+
     cmd = [
         "torchrun",
         "--nproc_per_node=2",
+        f"--master_port={port}",
         "scripts/train_distributed.py",
         "--preset",                 "infinity-reasoning-0.12b",
         "--token-cache-dir",        CACHE_DIR,
@@ -226,7 +239,25 @@ def launch_training():
     ]
     
     print(f"Executing: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    
+    # Run torchrun with live streaming output to catch all errors immediately
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+    
+    # Read output line-by-line as it prints
+    for line in iter(process.stdout.readline, ""):
+        print(line, end="", flush=True)
+        
+    process.stdout.close()
+    return_code = process.wait()
+    
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
 
 if __name__ == "__main__":
     setup_environment()
