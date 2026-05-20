@@ -34,14 +34,17 @@ SHARD_TOKENS = 25_000_000  # 25M tokens per shard
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_MIX = [
     # (hf_id, subset, split, weight, formatter)
+    # SlimPajama requires zstandard to decompress stream files
     ("cerebras/SlimPajama-627B",                   None,                    "train", 2,
      lambda r: r.get("text", "")),
-    ("FinanceInc/auditor_sentiment_mined",          None,                    "train", 1,
+    # Correct path is FinanceInc/auditor_sentiment
+    ("FinanceInc/auditor_sentiment",               None,                    "train", 1,
      lambda r: f"User: Analyze this financial statement.\nAssistant: {r.get('sentence', '')}"),
     ("wikimedia/wikipedia",                        "20231101.en",           "train", 1,
      lambda r: r.get("text", "")),
-    ("Qwen/Qwen2.5-Math-1.5M",                    None,                    "train", 1,
-     lambda r: f"User: {r.get('problem', '')}\nAssistant: {r.get('solution', '')}"),
+    # Correct path is Qwen/Qwen2.5-Math-1.1M-CoT
+    ("Qwen/Qwen2.5-Math-1.1M-CoT",                 None,                    "train", 1,
+     lambda r: f"User: {r.get('problem', '')}\nAssistant: {r.get('cot_content', '')}"),
     ("HuggingFaceH4/CodeAlpaca_20K",               None,                    "train", 1,
      lambda r: f"User: {r.get('prompt', '')}\nAssistant: {r.get('completion', '')}"),
     ("teknium/OpenHermes-2.5",                     None,                    "train", 1,
@@ -62,7 +65,8 @@ def setup_environment():
         print(f"Cloning codebase from {REPO_URL}...")
         subprocess.run(["git", "clone", REPO_URL, CMF_DIR], check=True)
     
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate"], check=True)
+    # Must install zstandard for SlimPajama streaming decompressions
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate", "zstandard"], check=True)
     print("All packages installed.\n")
 
 def dataset_download_thread(hf_id, subset, split, weight, fmt, text_queue, shutdown_event):
@@ -210,6 +214,8 @@ def launch_training():
     port = find_free_port()
     print(f"Using dynamically allocated master port: {port}")
 
+    # Reduce micro-batch-size from 16 to 2 and increase grad-accum to 32
+    # This maintains the exact same global batch size (128) but uses 8x less VRAM!
     cmd = [
         "torchrun",
         "--nproc_per_node=2",
@@ -218,8 +224,8 @@ def launch_training():
         "--preset",                 "infinity-reasoning-0.12b",
         "--token-cache-dir",        CACHE_DIR,
         "--seq-len",                "1024",
-        "--micro-batch-size",       "16",
-        "--grad-accum",             "4",
+        "--micro-batch-size",       "2",
+        "--grad-accum",             "32",
         "--steps",                  "25000",
         "--save-every",             "10",
         "--checkpoint-dir",         WORKSPACE_DIR,
@@ -240,13 +246,18 @@ def launch_training():
     
     print(f"Executing: {' '.join(cmd)}")
     
+    # Configure env to prevent VRAM fragmentation as recommended by PyTorch
+    env = os.environ.copy()
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    
     # Run torchrun with live streaming output to catch all errors immediately
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1
+        bufsize=1,
+        env=env
     )
     
     # Read output line-by-line as it prints
