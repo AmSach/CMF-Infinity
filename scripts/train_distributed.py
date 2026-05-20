@@ -450,7 +450,10 @@ def train(args: argparse.Namespace) -> None:
     )
 
     model.train()
-    start_time = time.perf_counter()
+    start_time_fallback = time.perf_counter()
+    tokens_seen_fallback = tokens_seen
+    warmup_start_time = None
+    warmup_tokens_seen = 0
     save_thread = None
 
     for step in range(start_step, args.steps):
@@ -531,15 +534,30 @@ def train(args: argparse.Namespace) -> None:
                 if is_master:
                     print(f"GRPO Self-Play non-fatal skip: {e}")
 
+        # Update warmup timing references after the first 3 steps of this run to ignore compilation/data loading overhead
+        steps_done_this_run = step + 1 - start_step
+        if steps_done_this_run == 3:
+            warmup_start_time = time.perf_counter()
+            warmup_tokens_seen = tokens_seen
+
         if is_master and (step + 1) % args.log_every == 0:
-            elapsed = time.perf_counter() - start_time
             total_tokens = tokens_seen * world_size
             current_lr = scheduler.get_last_lr()[0]
             avg_loss = step_loss / args.grad_accum
             
-            # Calculate highly precise ETA for the entire epoch
-            steps_done_this_run = step + 1 - start_step
-            seconds_per_step = elapsed / max(1, steps_done_this_run)
+            # Calculate elapsed time and tokens depending on whether warmup has completed
+            if warmup_start_time is not None:
+                elapsed_since_warmup = time.perf_counter() - warmup_start_time
+                steps_measured = step + 1 - (start_step + 3)
+                seconds_per_step = elapsed_since_warmup / max(1, steps_measured)
+                tokens_this_run = (tokens_seen - warmup_tokens_seen) * world_size
+                current_tok_s = tokens_this_run / max(1e-6, elapsed_since_warmup)
+            else:
+                elapsed_since_start = time.perf_counter() - start_time_fallback
+                seconds_per_step = elapsed_since_start / max(1, steps_done_this_run)
+                tokens_this_run = (tokens_seen - tokens_seen_fallback) * world_size
+                current_tok_s = tokens_this_run / max(1e-6, elapsed_since_start)
+                
             steps_remaining = args.steps - (step + 1)
             seconds_remaining = steps_remaining * seconds_per_step
             
@@ -552,7 +570,7 @@ def train(args: argparse.Namespace) -> None:
                 minutes = int((seconds_remaining % 3600) // 60)
                 eta_str = f"{hours}h {minutes}m"
                 
-            print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={total_tokens/max(1e-6, elapsed):.0f} eta={eta_str}")
+            print(f"step={step+1}/{args.steps} loss={avg_loss:.4f} lr={current_lr:.3e} tokens={total_tokens:,} tok/s={current_tok_s:.0f} eta={eta_str}")
             
             # Print latest tokenizer status alongside training logs cleanly
             tok_log_file = args.checkpoint_dir.parent.parent / "tokenizer_output.log" if args.checkpoint_dir else None

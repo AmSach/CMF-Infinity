@@ -572,7 +572,6 @@ def compile_file(md_path: Path, pdf_path: Path, workspace_dir: Path):
     doc = fitz.open(temp_path)
     bg_color = (1.0, 1.0, 1.0)
     for page in doc:
-        page.wrap_contents()
         page.draw_rect(page.rect, color=bg_color, fill=bg_color, overlay=False)
     
     print(f"Saving final processed paper PDF to {pdf_path}...")

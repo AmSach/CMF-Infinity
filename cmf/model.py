@@ -686,8 +686,8 @@ class DeliberativeContinuousMeaningField(nn.Module):
         top_k: Optional[int] = None,
         use_velocity_halting: bool = True,
         velocity_epsilon: float = 0.005,
-        stochastic_langevin: bool = False, # Disabled: Replaced by deterministic Symplectic Hamiltonian dynamics
-        langevin_noise_scale: float = 0.0,
+        stochastic_langevin: bool = True, # Enabled: Combined with Symplectic curl for noise-driven escape
+        langevin_noise_scale: float = 1e-4,
         sharp_memory_scale: float = 0.25, # Enabled by default for zero-shot attention sharpness!
         repetition_penalty: float = 1.15,
     ) -> torch.Tensor:
@@ -749,6 +749,12 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 delta_p = delta_z[..., d_half:]
                 symplectic_curl = torch.cat([delta_p, -delta_q], dim=-1)
                 z_next = z_next + 0.10 * symplectic_curl
+                
+                # 4. Langevin Stochastic Noise Injection (Breaks cyclic orbits to escape loops)
+                if stochastic_langevin and temperature > 0.0:
+                    noise = torch.randn_like(z_next) * langevin_noise_scale * temperature
+                    jitter = torch.sin(z_next * 1000.0) * 1e-6
+                    z_next = z_next + noise + jitter
                 
                 if use_velocity_halting:
                     # L2 norm over model dimension

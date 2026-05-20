@@ -613,7 +613,6 @@ def compile_textbook():
     doc = fitz.open(temp_path)
     bg_color = (253/255, 251/255, 247/255)
     for page in doc:
-        page.wrap_contents()
         page.draw_rect(page.rect, color=bg_color, fill=bg_color, overlay=False)
     
     print(f"Saving final processed textbook PDF to {pdf_path}...")
