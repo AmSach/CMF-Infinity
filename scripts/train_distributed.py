@@ -155,9 +155,9 @@ def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
         model.eval()
         with torch.no_grad():
             if hasattr(model, "module"):
-                generated = model.module.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+                generated = model.module.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True, repetition_penalty=5.0)
             else:
-                generated = model.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True)
+                generated = model.generate(input_ids, max_new_tokens=30, temperature=0.7, use_velocity_halting=True, repetition_penalty=5.0)
                 
         text_out = enc.decode(generated[0][input_ids.size(1):].tolist())
         reward = evaluate_math_reward(text_out, target_ans)

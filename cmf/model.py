@@ -689,6 +689,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         stochastic_langevin: bool = False, # Disabled: Replaced by deterministic Symplectic Hamiltonian dynamics
         langevin_noise_scale: float = 0.0,
         sharp_memory_scale: float = 0.25, # Enabled by default for zero-shot attention sharpness!
+        repetition_penalty: float = 1.15,
     ) -> torch.Tensor:
         self.eval()
         generated = input_ids
@@ -768,7 +769,6 @@ class DeliberativeContinuousMeaningField(nn.Module):
             logits = self.output(self.state_norm(z))
             
             # 4. Apply Repetition Penalty to prevent coordinate collapse loops
-            repetition_penalty = 1.15
             if repetition_penalty != 1.0:
                 logits = logits.clone()
                 for batch_idx in range(generated.size(0)):
