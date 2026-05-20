@@ -1,11 +1,11 @@
 """
-CMF-Infinity AGI Pre-Training Pipeline (Direct Streaming & Concurrent Training)
-================================───────────────────────────────────────────────
-- Streams directly from HF to memory, tokenizes, and saves .pt shards (no raw JSONL file).
-- Deletes consumed shards automatically to maintain < 1GB disk footprint.
-- Launches tokenizer in the background and trainer in the foreground concurrently.
-- Training starts immediately as soon as the first shard is written.
-- Checkpoints saved directly to /kaggle/working root every 10 steps.
+CMF-Infinity AGI Pre-Training Pipeline (Parallel Streaming & Concurrent Training)
+=================================================================================
+- Streams multiple HF datasets in parallel using multi-threaded downloaders (max NIC speed).
+- Queues downloaded texts to a thread-safe buffer queue (memory-capped to prevent OOM).
+- Tokenizes background data and writes .pt shards.
+- Deletes consumed shards automatically to preserve disk limits.
+- Launches tokenizer in background and trainer in foreground concurrently.
 """
 
 import os
@@ -16,11 +16,12 @@ import sys
 import time
 import torch
 import threading
+import queue
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-REPO_URL = "https://github.com/YOUR_USERNAME/CMF.git"
+REPO_URL = "https://github.com/AmSach/CMF-Infinity.git"
 WORKSPACE_DIR = "/kaggle/working"
 CMF_DIR = os.path.join(WORKSPACE_DIR, "CMF")
 CACHE_DIR = os.path.join(WORKSPACE_DIR, "agi_shards")
@@ -32,6 +33,7 @@ SHARD_TOKENS = 25_000_000  # 25M tokens per shard
 # DATASET MIX CONFIGURATION (Direct HF Streaming)
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_MIX = [
+    # (hf_id, subset, split, weight, formatter)
     ("cerebras/SlimPajama-627B",                   None,                    "train", 2,
      lambda r: r.get("text", "")),
     ("FinanceInc/auditor_sentiment_mined",          None,                    "train", 1,
@@ -63,44 +65,66 @@ def setup_environment():
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate"], check=True)
     print("All packages installed.\n")
 
+def dataset_download_thread(hf_id, subset, split, weight, fmt, text_queue, shutdown_event):
+    """Worker thread downloading a single dataset stream in parallel."""
+    from datasets import load_dataset
+    try:
+        kwargs = {"split": split, "streaming": True}
+        if subset:
+            it = iter(load_dataset(hf_id, subset, **kwargs))
+        else:
+            it = iter(load_dataset(hf_id, **kwargs))
+        
+        while not shutdown_event.is_set():
+            try:
+                row = next(it)
+                text = fmt(row)
+                if text and text.strip():
+                    # Insert multiple times based on weight to maintain correct ratio
+                    for _ in range(weight):
+                        if shutdown_event.is_set():
+                            break
+                        text_queue.put(text, block=True, timeout=1.0)
+            except StopIteration:
+                break
+            except queue.Full:
+                time.sleep(0.1)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"\n[Download Thread] Error on {hf_id}: {e}")
+
 def tokenization_worker():
-    """Background worker that streams directly from HF, tokenizes, and saves shards."""
+    """Background worker orchestrating parallel streams and tokenizing text."""
     print("=" * 60)
     print("1. Background Tokenizer Initializing")
     print("=" * 60)
-    from datasets import load_dataset
     from transformers import AutoTokenizer
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     eos_id = tokenizer.eos_token_id
 
-    iterators = []
-    weights = []
+    # Create thread-safe text queue to cap RAM usage (1000 items max)
+    text_queue = queue.Queue(maxsize=1000)
+    shutdown_event = threading.Event()
+
+    # Launch parallel downloader threads
+    threads = []
     for hf_id, subset, split, weight, fmt in DATASET_MIX:
-        try:
-            kwargs = {"split": split, "streaming": True}
-            if subset:
-                it = iter(load_dataset(hf_id, subset, **kwargs))
-            else:
-                it = iter(load_dataset(hf_id, **kwargs))
-            iterators.append((it, fmt))
-            weights.append(weight)
-        except Exception as e:
-            print(f"Warning: Failed to load dataset {hf_id}: {e}")
-
-    if not iterators:
-        print("Error: No datasets successfully loaded. Aborting background tokenizer.")
-        return
-
-    pool = []
-    for i, w in enumerate(weights):
-        pool.extend([i] * w)
+        t = threading.Thread(
+            target=dataset_download_thread,
+            args=(hf_id, subset, split, weight, fmt, text_queue, shutdown_event),
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+    
+    print(f"[Tokenizer] Launched {len(threads)} parallel dataset download threads.")
 
     tokens_seen = 0
     shard_idx = 0
     buffer = []
-    exhausted = set()
     manifest_shards = []
 
     def save_shard(toks, idx):
@@ -117,7 +141,6 @@ def tokenization_worker():
             json.dump(meta, mf)
         
         manifest_shards.append({"path": fname, "tokens_count": len(toks[:SHARD_TOKENS])})
-        # Write/Update manifest.json
         manifest = {
             "format": "cmf.token_cache_dir.v1",
             "complete": tokens_seen >= TARGET_TOKENS,
@@ -130,35 +153,33 @@ def tokenization_worker():
         print(f"\n[Tokenizer] Saved shard {fname} ({len(toks[:SHARD_TOKENS]):,} tokens). Total: {tokens_seen:,}/{TARGET_TOKENS:,}")
         return toks[SHARD_TOKENS:]
 
-    print("[Tokenizer] Direct HF stream active. Generating shards...")
-    random.seed(42)
-    
-    while len(exhausted) < len(iterators) and tokens_seen < TARGET_TOKENS:
-        random.shuffle(pool)
-        for idx in pool:
-            if idx in exhausted:
-                continue
-            it, fmt = iterators[idx]
-            try:
-                row = next(it)
-                text = fmt(row)
-                if text and text.strip():
-                    encoded = tokenizer.encode(text, add_special_tokens=False) + [eos_id]
-                    buffer.extend(encoded)
-                    tokens_seen += len(encoded)
+    while tokens_seen < TARGET_TOKENS:
+        # Check if download threads are still alive
+        alive_threads = any(t.is_alive() for t in threads)
+        if not alive_threads and text_queue.empty():
+            print("\n[Tokenizer] All parallel download streams completed/exhausted.")
+            break
+        
+        try:
+            # Pull text from the parallel downloads queue
+            text = text_queue.get(block=True, timeout=2.0)
+            encoded = tokenizer.encode(text, add_special_tokens=False) + [eos_id]
+            buffer.extend(encoded)
+            tokens_seen += len(encoded)
 
-                    while len(buffer) >= SHARD_TOKENS:
-                        buffer = save_shard(buffer, shard_idx)
-                        shard_idx += 1
-            except StopIteration:
-                exhausted.add(idx)
-            except Exception:
-                pass
+            while len(buffer) >= SHARD_TOKENS:
+                buffer = save_shard(buffer, shard_idx)
+                shard_idx += 1
+            text_queue.task_done()
+        except queue.Empty:
+            continue
 
     if buffer and tokens_seen < TARGET_TOKENS:
         save_shard(buffer, shard_idx)
         shard_idx += 1
 
+    shutdown_event.set()
+    
     # Mark manifest complete
     manifest = {
         "format": "cmf.token_cache_dir.v1",
@@ -169,7 +190,7 @@ def tokenization_worker():
     }
     with open(os.path.join(CACHE_DIR, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"\n[Tokenizer] Finished streaming. Total tokens prepared: {tokens_seen:,}")
+    print(f"\n[Tokenizer] Finished. Total tokens: {tokens_seen:,}")
 
 def launch_training():
     print("=" * 60)
@@ -201,7 +222,7 @@ def launch_training():
         "--clip-grad-norm",         "1.0",
         "--empty-cache-every",      "50",
         "--log-every",              "1",
-        "--delete-consumed-shards", # Automatically delete consumed shards to preserve Kaggle disk space!
+        "--delete-consumed-shards",
     ]
     
     print(f"Executing: {' '.join(cmd)}")
@@ -210,13 +231,13 @@ def launch_training():
 if __name__ == "__main__":
     setup_environment()
 
-    # Start the tokenizer in a background thread
+    # Start the orchestrator background thread
     t_thread = threading.Thread(target=tokenization_worker, daemon=True)
     t_thread.start()
 
-    # Give the tokenizer a small head start to write the first file metadata
+    # Give the download threads 15 seconds to connect, download, and write the first shard
     print("Waiting for tokenizer to begin writing...")
-    time.sleep(10.0)
+    time.sleep(15.0)
 
-    # Launch the trainer (which blocks and waits for the first shard if it's not ready yet)
+    # Launch the trainer (it blocks/waits if tokens_000000.pt isn't fully written yet)
     launch_training()
