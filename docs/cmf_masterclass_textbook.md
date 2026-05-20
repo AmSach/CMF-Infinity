@@ -293,7 +293,7 @@ To fix this, we replace the lasers with **Causal Dilated Convolutions**. Think o
 
 #### 🌌 The Visual Analogy: Gravitational Ripples in a Pond
 
-![Causal Dilated Convolutions as Gravity Ripples](dilated_gravity_ripples.png)
+![Causal Dilated Convolutions as Gravity Ripples](dilated_ripples_bw.png)
 
 Imagine the semantic universe is a massive, glowing, dark-blue pond. Every time a previous word is spoken, it drops into the pond like a heavy pebble, casting outward bright cyan **gravitational ripples**. 
 
@@ -317,7 +317,7 @@ To solve this, we wrap that tiny scalar decimal into a massive array of sine and
 
 #### 🧬 The Visual Analogy: The Temporal Helix Speedometer
 
-![Temporal Helix Track and Speedometer](temporal_helix.png)
+![Temporal Helix Track and Speedometer](temporal_helix_bw.png)
 
 Imagine a glowing spaceship particle flying through the absolute pitch-black void of deep space. Because there are no stars, the pilot has absolutely no sense of speed, distance, or how long they have been traveling.
 
