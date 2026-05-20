@@ -146,7 +146,7 @@ def run_grpo_self_play(model, enc, device, scaler, optimizer, args):
     # 1. Rank 0 generates the prompt and trajectory stochastically
     if rank == 0:
         a, b = random.randint(1, 20), random.randint(1, 20)
-        prompt = f"User: Calculate {a} + {b} and explain the steps.\nAssistant:"
+        prompt = f"Problem: {a} + {b} = ?\nAnswer: To solve {a} + {b}, we first "
         target_ans = str(a + b)
         
         input_ids = torch.tensor([enc.encode(prompt)], device=device)
