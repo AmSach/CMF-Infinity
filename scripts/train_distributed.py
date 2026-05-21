@@ -327,13 +327,13 @@ def train(args: argparse.Namespace) -> None:
             
             # Wrap any submodules with >= 1M parameters to enable layer-by-layer sharding
             raw_model = model
-            def custom_auto_wrap_policy(module, recurse, **kwargs):
+            def custom_auto_wrap_policy(module, recurse, unwrapped_params=0, **kwargs):
                 # Never wrap tied embedding/output layers individually to preserve shared parameters
                 if getattr(raw_model.config, "tie_embeddings", False):
                     if module is getattr(raw_model, "embedding", None) or module is getattr(raw_model, "output", None):
                         return False
                 # Use nonwrapped_numel (new API) or unwrapped_params (old API) for size threshold
-                numel = kwargs.get("nonwrapped_numel", kwargs.get("unwrapped_params", 0))
+                numel = kwargs.get("nonwrapped_numel", unwrapped_params)
                 if recurse:
                     return True
                 return numel >= 1_000_000
