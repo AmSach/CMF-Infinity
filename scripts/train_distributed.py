@@ -405,13 +405,21 @@ def train(args: argparse.Namespace) -> None:
     if checkpoint_exists and not has_nan and payload is not None:
         if "optimizer" in payload and payload["optimizer"] is not None:
             try:
-                optimizer.load_state_dict(payload["optimizer"])
+                if is_fsdp:
+                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                        sharded_osd = FSDP.optim_state_dict_to_load(model, optimizer, payload["optimizer"])
+                    optimizer.load_state_dict(sharded_osd)
+                else:
+                    optimizer.load_state_dict(payload["optimizer"])
                 if is_master:
                     print("Successfully restored optimizer state dict on all ranks!")
             except Exception as e:
                 if is_master:
                     print(f"Warning: Failed to restore optimizer state dict: {e}")
-        if "scaler" in payload and payload["scaler"] is not None and not is_fsdp:
+        if "scaler" in payload and payload["scaler"] is not None:
             try:
                 scaler.load_state_dict(payload["scaler"])
                 if is_master:
@@ -604,9 +612,12 @@ def train(args: argparse.Namespace) -> None:
                     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
                     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                         state_dict_to_save = model.state_dict()
+                        optim_state_to_save = FSDP.optim_state_dict(model, optimizer)
                     if is_master:
                         payload = {
                             "model": state_dict_to_save,
+                            "optimizer": optim_state_to_save,
+                            "scaler": scaler.state_dict() if scaler is not None else None,
                             "config": config,
                             "training": {"step": step + 1, "tokens": tokens_seen * world_size}
                         }

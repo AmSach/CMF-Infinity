@@ -14,11 +14,15 @@ def euler_step(
 ) -> torch.Tensor:
     """Perform a single Euler step with Context-Guided Manifold Projection (CGMP)."""
     z_next = z + dt * field_fn(z, context, tau)
-    z_mean = z_next.mean(dim=-1, keepdim=True)
-    z_std = z_next.std(dim=-1, keepdim=True)
-    c_mean = context.mean(dim=-1, keepdim=True)
-    c_std = context.std(dim=-1, keepdim=True)
-    return ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+    if z_next.size(-1) > 1:
+        z_mean = z_next.mean(dim=-1, keepdim=True)
+        z_std = z_next.std(dim=-1, keepdim=True, unbiased=False)
+        c_mean = context.mean(dim=-1, keepdim=True)
+        c_std = context.std(dim=-1, keepdim=True, unbiased=False)
+        mask = (c_std > 1e-5) & (z_std > 1e-6)
+        projected = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+        z_next = torch.where(mask, projected, z_next)
+    return z_next
 
 def rk4_step(
     z: torch.Tensor,
@@ -33,11 +37,15 @@ def rk4_step(
     k3 = field_fn(z + 0.5 * dt * k2, context, tau + 0.5 * dt)
     k4 = field_fn(z + dt * k3, context, tau + dt)
     z_next = z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    z_mean = z_next.mean(dim=-1, keepdim=True)
-    z_std = z_next.std(dim=-1, keepdim=True)
-    c_mean = context.mean(dim=-1, keepdim=True)
-    c_std = context.std(dim=-1, keepdim=True)
-    return ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+    if z_next.size(-1) > 1:
+        z_mean = z_next.mean(dim=-1, keepdim=True)
+        z_std = z_next.std(dim=-1, keepdim=True, unbiased=False)
+        c_mean = context.mean(dim=-1, keepdim=True)
+        c_std = context.std(dim=-1, keepdim=True, unbiased=False)
+        mask = (c_std > 1e-5) & (z_std > 1e-6)
+        projected = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+        z_next = torch.where(mask, projected, z_next)
+    return z_next
 
 def integrate_symplectic_leapfrog(
     z0: torch.Tensor,

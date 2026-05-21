@@ -754,6 +754,9 @@ class DeliberativeContinuousMeaningField(nn.Module):
         for _ in range(max_new_tokens):
             # Run context encoder on the full active sequence
             context = self.encoder(self.embedding(generated))
+            cos, sin = self.rope(context, context.size(1))
+            context = apply_rotary_pos_emb(context, cos, sin)
+            
             # Grab the last position's context representation
             c_last = context[:, -1]
             
