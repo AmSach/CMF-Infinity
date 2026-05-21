@@ -44,7 +44,8 @@ DATASET_MIX = [
     ("wikimedia/wikipedia",                        "20231101.en",           "train", 1,
      lambda r: r.get("text", "")),
     # NVIDIA OpenMathReasoning: open-access math CoT (replaces gated Qwen dataset)
-    ("nvidia/OpenMathReasoning",                   None,                    "train", 1,
+    # Note: no 'train' split - available: 'cot', 'tir', 'genselect', 'additional_problems'
+    ("nvidia/OpenMathReasoning",                   None,                    "cot",   1,
      lambda r: f"User: {r.get('problem', '')}\nAssistant: {r.get('generated_solution', '')}"),
     # Code instruction following
     ("HuggingFaceH4/CodeAlpaca_20K",               None,                    "train", 1,

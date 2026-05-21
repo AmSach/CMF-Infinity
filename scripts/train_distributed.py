@@ -315,7 +315,7 @@ def train(args: argparse.Namespace) -> None:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
             
-            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy  # kept for reference
             import functools
             
             # Keep parameters in FP16 on GPU VRAM for massive memory savings and Tensor Core speed
@@ -327,14 +327,16 @@ def train(args: argparse.Namespace) -> None:
             
             # Wrap any submodules with >= 1M parameters to enable layer-by-layer sharding
             raw_model = model
-            def custom_auto_wrap_policy(module, recurse, unwrapped_params):
+            def custom_auto_wrap_policy(module, recurse, **kwargs):
                 # Never wrap tied embedding/output layers individually to preserve shared parameters
                 if getattr(raw_model.config, "tie_embeddings", False):
                     if module is getattr(raw_model, "embedding", None) or module is getattr(raw_model, "output", None):
                         return False
-                return size_based_auto_wrap_policy(
-                    module, recurse, unwrapped_params, min_num_params=1_000_000
-                )
+                # Use nonwrapped_numel (new API) or unwrapped_params (old API) for size threshold
+                numel = kwargs.get("nonwrapped_numel", kwargs.get("unwrapped_params", 0))
+                if recurse:
+                    return True
+                return numel >= 1_000_000
             
             # Wrap on CPU first. FSDP will automatically shard and move parameters to local_rank GPU
             model = FSDP(
