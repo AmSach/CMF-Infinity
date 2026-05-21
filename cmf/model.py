@@ -384,6 +384,7 @@ class ContinuousMeaningField(nn.Module):
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
+                ignore_index=-100,
             )
             result["loss"] = loss
         if return_states:
@@ -508,6 +509,7 @@ class ParallelContinuousMeaningField(nn.Module):
             result["loss"] = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
+                ignore_index=-100,
             )
         if return_states:
             result["states"] = z
@@ -785,6 +787,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
             result["loss"] = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
+                ignore_index=-100,
             )
         if return_states:
             if states:
