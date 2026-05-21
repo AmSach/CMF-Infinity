@@ -484,6 +484,12 @@ class ParallelContinuousMeaningField(nn.Module):
             # Parallel model also gets the goal vector
             velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z)
             z = z + dt * velocity
+            # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+            z_mean = z.mean(dim=-1, keepdim=True)
+            z_std = z.std(dim=-1, keepdim=True)
+            c_mean = context.mean(dim=-1, keepdim=True)
+            c_std = context.std(dim=-1, keepdim=True)
+            z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
 
         logits = self.output(self.state_norm(z))
         result: dict[str, torch.Tensor] = {"logits": logits}
@@ -632,6 +638,13 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
                 z = z + gate * (proposal - z)
                 
+                # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+                z_mean = z.mean(dim=-1, keepdim=True)
+                z_std = z.std(dim=-1, keepdim=True)
+                c_mean = context.mean(dim=-1, keepdim=True)
+                c_std = context.std(dim=-1, keepdim=True)
+                z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+                
                 halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z)))
                 halt_means.append(halt_prob.mean())
                 actual_steps = step_idx + 1
@@ -666,6 +679,13 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     
                     # Core residual physics update strictly executed in FP32
                     z_accum = z_accum + gate.to(torch.float32) * (proposal.to(torch.float32) - z_accum)
+                    
+                    # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+                    z_mean = z_accum.mean(dim=-1, keepdim=True)
+                    z_std = z_accum.std(dim=-1, keepdim=True)
+                    c_mean = context_val.mean(dim=-1, keepdim=True)
+                    c_std = context_val.std(dim=-1, keepdim=True)
+                    z_accum = ((z_accum - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
                     
                     # Ponder cost mechanism: penalize low halt probabilities at each step 
                     # to strictly calibrate the halting head (solves over-thinking bottleneck)
