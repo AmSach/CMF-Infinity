@@ -812,6 +812,13 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     noise = torch.randn_like(z_next) * langevin_noise_scale * temperature
                     jitter = torch.sin(z_next * 1000.0) * 1e-6
                     z_next = z_next + noise + jitter
+                    
+                # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+                z_mean = z_next.mean(dim=-1, keepdim=True)
+                z_std = z_next.std(dim=-1, keepdim=True)
+                c_mean = c_effective.mean(dim=-1, keepdim=True)
+                c_std = c_effective.std(dim=-1, keepdim=True)
+                z_next = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
                 
                 if use_velocity_halting:
                     # L2 norm over model dimension
@@ -941,6 +948,12 @@ class FastParallelContinuousMeaningField(nn.Module):
         h = torch.cat([z, context, m_context, goal], dim=-1)
         velocity = torch.tanh(self.proposal(h)) * torch.sigmoid(self.gate(h))
         z = z + velocity
+        # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+        z_mean = z.mean(dim=-1, keepdim=True)
+        z_std = z.std(dim=-1, keepdim=True)
+        c_mean = context.mean(dim=-1, keepdim=True)
+        c_std = context.std(dim=-1, keepdim=True)
+        z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
         logits = self.output(self.state_norm(z))
 
         result: dict[str, torch.Tensor] = {"logits": logits}
