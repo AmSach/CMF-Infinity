@@ -38,8 +38,8 @@ OUTPUT_DIR = ROOT / "records" / "checkpoints" / "cmf_lora_slimpajama_200m"
 
 # Training hyper‑parameters (ultra‑lightweight)
 NUM_EPOCHS = 2
-BATCH_SIZE = 16           # Maximize GPU core saturation
-GRAD_ACCUM_STEPS = 2      # Keeps effective batch size at 32
+BATCH_SIZE = 64           # Maximize GPU core saturation based on VRAM capacity
+GRAD_ACCUM_STEPS = 1      # Set to 1 as batch size is sufficiently large
 LR = 5e-4
 MAX_SEQ_LEN = 1024
 BLOCK_SIZE = 256          # tokens per training example – fits comfortably in memory
@@ -65,11 +65,11 @@ model, tokenizer = load_package(PACKAGE_PATH)
 # Optimize model for low‑memory training (8‑bit) and attach LoRA
 # ---------------------------------------------------------------------------
 model = prepare_model_for_kbit_training(model)
-# Target modules are linear projection layers; adjust if needed for your architecture.
+# Target modules are linear projection and convolution layers matching CMF's structure.
 lora_cfg = LoraConfig(
     r=8,
     lora_alpha=16,
-    target_modules=["c_attn", "c_proj", "dense", "proj"],
+    target_modules=["proj", "proposal", "update_gate", "gate", "q_proj", "k_proj", "v_proj", "out_proj", "conv"],
     lora_dropout=0.1,
     bias="none",
 )

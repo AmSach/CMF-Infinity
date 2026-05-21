@@ -153,26 +153,30 @@ def run_verification():
             "target": sc["action"]
         })
 
-    # 3. Train on Drone Flight Policies to show Learning Capacity
+    # 3. Train on Drone Flight Policies to show Learning Capacity (Batched for speed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.003)
     model.train()
     
     print(">>> Training CMF on Drone Emergency Flight Rules (Overfitting test)...")
+    max_len = max(sc["input_ids"].size(0) for sc in tokenized_scenarios)
+    padded_inputs = []
+    padded_labels = []
+    for sc in tokenized_scenarios:
+        pad_len = max_len - sc["input_ids"].size(0)
+        padded_inputs.append(F.pad(sc["input_ids"], (0, pad_len), value=0))
+        padded_labels.append(F.pad(sc["labels"], (0, pad_len), value=-100))
+        
+    x_batch = torch.stack(padded_inputs).to(device)
+    y_batch = torch.stack(padded_labels).to(device)
+    
     for step in range(450):
-        total_loss = 0
         optimizer.zero_grad()
-        for sc in tokenized_scenarios:
-            x = sc["input_ids"].unsqueeze(0).to(device)
-            y = sc["labels"].unsqueeze(0).to(device)
-            
-            out = model(x, labels=y)
-            loss = out["loss"] + 0.1 * out.get("ponder_loss", torch.tensor(0.0, device=device))
-            loss.backward()
-            total_loss += loss.item()
-            
+        out = model(x_batch, labels=y_batch)
+        loss = out["loss"] + 0.1 * out.get("ponder_loss", torch.tensor(0.0, device=device))
+        loss.backward()
         optimizer.step()
         if (step + 1) % 50 == 0:
-            print(f"    Step {step + 1}/450 | Training Loss: {total_loss / len(DRONE_SCENARIOS):.4f}")
+            print(f"    Step {step + 1}/450 | Training Loss: {loss.item():.4f}")
 
     # 4. Evaluate Capabilities (Full Precision FP32)
     model.eval()

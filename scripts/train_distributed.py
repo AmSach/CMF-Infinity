@@ -326,17 +326,22 @@ def train(args: argparse.Namespace) -> None:
             )
             
             # Wrap any submodules with >= 1M parameters to enable layer-by-layer sharding
-            my_auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy,
-                min_num_params=1_000_000
-            )
+            raw_model = model
+            def custom_auto_wrap_policy(module, recurse, unwrapped_params):
+                # Never wrap tied embedding/output layers individually to preserve shared parameters
+                if getattr(raw_model.config, "tie_embeddings", False):
+                    if module is getattr(raw_model, "embedding", None) or module is getattr(raw_model, "output", None):
+                        return False
+                return size_based_auto_wrap_policy(
+                    module, recurse, unwrapped_params, min_num_params=1_000_000
+                )
             
             # Wrap on CPU first. FSDP will automatically shard and move parameters to local_rank GPU
             model = FSDP(
                 model,
                 device_id=local_rank,
                 mixed_precision=mp_policy,
-                auto_wrap_policy=my_auto_wrap_policy,
+                auto_wrap_policy=custom_auto_wrap_policy,
                 sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
                 sync_module_states=True
             )
