@@ -6,7 +6,6 @@ from cmf import (
     CMFConfig,
     ContinuousMeaningField,
     DeliberativeContinuousMeaningField,
-    FastParallelContinuousMeaningField,
     ParallelContinuousMeaningField,
 )
 from cmf.fast_integrator import euler_integrate_precomputed
@@ -38,17 +37,7 @@ def test_parallel_cmf_forward_shapes():
     assert output["loss"].ndim == 0
 
 
-def test_fast_parallel_cmf_forward_shapes():
-    config = CMFConfig(vocab_size=32, d_model=16, hidden_dim=32, num_layers=3)
-    model = FastParallelContinuousMeaningField(config)
-    input_ids = torch.randint(0, config.vocab_size, (2, 8))
-    labels = torch.randint(0, config.vocab_size, (2, 8))
 
-    output = model(input_ids, labels=labels, return_states=True)
-
-    assert output["logits"].shape == (2, 8, config.vocab_size)
-    assert output["states"].shape == (2, 8, config.d_model)
-    assert output["loss"].ndim == 0
 
 
 def test_deliberative_cmf_forward_shapes():

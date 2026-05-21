@@ -17,7 +17,6 @@ if str(ROOT) not in sys.path:
 
 from cmf import (
     CMFConfig,
-    FastParallelContinuousMeaningField,
     ParallelContinuousMeaningField,
 )
 from cmf.baselines import TemporalConvLM, TinyGPTLM
@@ -49,7 +48,7 @@ RECORDS = ROOT / "records" / "quality_efficiency"
 
 def make_models(max_seq_len: int) -> dict[str, torch.nn.Module]:
     return {
-        "fast_parallel_cmf": FastParallelContinuousMeaningField(
+        "parallel_cmf": ParallelContinuousMeaningField(
             CMFConfig(
                 vocab_size=256,
                 d_model=80,
@@ -194,7 +193,7 @@ def run(args: argparse.Namespace) -> dict:
 
     models = make_models(model_max_seq_len)
     results["parameter_match"] = parameter_match_report(
-        models["fast_parallel_cmf"],
+        models["parallel_cmf"],
         models["transformer"],
         tolerance=args.parameter_tolerance,
     )

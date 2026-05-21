@@ -2,7 +2,6 @@ from .config import CMFConfig, TrainingConfig
 from .model import (
     ContinuousMeaningField,
     DeliberativeContinuousMeaningField,
-    FastParallelContinuousMeaningField,
     ParallelContinuousMeaningField,
 )
 from .runtime import resolve_device
@@ -20,7 +19,6 @@ __all__ = [
     "ContinuousMeaningField",
     "ParallelContinuousMeaningField",
     "DeliberativeContinuousMeaningField",
-    "FastParallelContinuousMeaningField",
     "resolve_device",
     "PRESETS",
     "get_preset",

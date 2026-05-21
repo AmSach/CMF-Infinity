@@ -3,7 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cmf.benchmarks import extract_answer, make_task_prompts, parameter_match_report, score_candidate
-from cmf import CMFConfig, FastParallelContinuousMeaningField
+from cmf import CMFConfig, ParallelContinuousMeaningField
 from cmf.baselines import TinyGPTLM
 from cmf.data import ByteTokenizer
 
@@ -23,7 +23,7 @@ def test_task_prompts_have_expected_answers():
 
 def test_score_candidate_returns_float():
     tokenizer = ByteTokenizer()
-    model = FastParallelContinuousMeaningField(
+    model = ParallelContinuousMeaningField(
         CMFConfig(vocab_size=256, d_model=8, hidden_dim=16, num_layers=1)
     )
     score = score_candidate(model, tokenizer, "Q: 1+1=? A: ", "2", torch.device("cpu"))
@@ -31,15 +31,15 @@ def test_score_candidate_returns_float():
 
 
 def test_parameter_match_report_flags_matched_models():
-    cmf = FastParallelContinuousMeaningField(
+    cmf = ParallelContinuousMeaningField(
         CMFConfig(vocab_size=256, d_model=80, hidden_dim=160, num_layers=3, tie_embeddings=False)
     )
     gpt = TinyGPTLM(
         vocab_size=256,
-        d_model=88,
+        d_model=96,
         nhead=4,
         num_layers=5,
-        hidden_dim=176,
+        hidden_dim=216,
         dropout=0.0,
         max_seq_len=128,
     )

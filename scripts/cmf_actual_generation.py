@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cmf.model import CMFConfig, FastParallelContinuousMeaningField
+from cmf.model import CMFConfig, ParallelContinuousMeaningField
 from cmf.runtime import resolve_device
 
 def generate_actual_cmf_image():
@@ -24,7 +24,7 @@ def generate_actual_cmf_image():
         num_layers=2,
         max_seq_len=1024
     )
-    model = FastParallelContinuousMeaningField(config).to(device)
+    model = ParallelContinuousMeaningField(config).to(device)
     
     # 2. Create Target Pattern: A White Cross
     target = torch.zeros((32, 32), device=device)

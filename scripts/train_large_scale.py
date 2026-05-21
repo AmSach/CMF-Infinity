@@ -17,7 +17,6 @@ from cmf import (
     CMFConfig,
     ContinuousMeaningField,
     DeliberativeContinuousMeaningField,
-    FastParallelContinuousMeaningField,
     ParallelContinuousMeaningField,
 )
 from cmf.checkpointing import load_model_package, save_model_package
@@ -73,8 +72,6 @@ def build_model(model_type: str, config: CMFConfig) -> torch.nn.Module:
         return ParallelContinuousMeaningField(config)
     if model_type == "deliberative_cmf":
         return DeliberativeContinuousMeaningField(config)
-    if model_type == "fast_parallel_cmf":
-        return FastParallelContinuousMeaningField(config)
     raise ValueError(f"Unsupported model_type: {model_type}")
 
 
@@ -395,7 +392,7 @@ def main() -> None:
     parser.add_argument("--token-cache", type=Path, help="Local token cache produced by scripts/prepare_hf_token_cache.py.")
     parser.add_argument("--token-cache-dir", type=Path, help="Directory of sharded token caches produced by scripts/prepare_hf_token_shards.py.")
     parser.add_argument("--preset", choices=["infinity-0.00037b", "infinity-0.12b", "infinity-reasoning-0.12b", "infinity-0.203b", "infinity-8b"])
-    parser.add_argument("--model-type", choices=["continuous_cmf", "parallel_cmf", "deliberative_cmf", "fast_parallel_cmf"], default="parallel_cmf")
+    parser.add_argument("--model-type", choices=["continuous_cmf", "parallel_cmf", "deliberative_cmf"], default="parallel_cmf")
     parser.add_argument("--tokenizer", choices=["auto", "byte", "gpt2", "hf"], default="auto")
     parser.add_argument("--tokenizer-name", help="Hugging Face tokenizer name when --tokenizer hf is used.")
     parser.add_argument("--d-model", type=int, default=512)

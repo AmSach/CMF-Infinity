@@ -2,21 +2,21 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cmf import CMFConfig, DeliberativeContinuousMeaningField, FastParallelContinuousMeaningField
+from cmf import CMFConfig, DeliberativeContinuousMeaningField, ParallelContinuousMeaningField
 from cmf.checkpointing import load_model_package, save_model_package
 from cmf.data import ByteTokenizer
 
 
 def test_model_package_round_trip(tmp_path):
     config = CMFConfig(vocab_size=32, d_model=8, hidden_dim=16, num_layers=1)
-    model = FastParallelContinuousMeaningField(config)
+    model = ParallelContinuousMeaningField(config)
     tokenizer = ByteTokenizer(vocab_size=256)
     path = tmp_path / "tiny.package.pt"
 
     save_model_package(
         path,
         model,
-        model_type="fast_parallel_cmf",
+        model_type="parallel_cmf",
         config=config,
         tokenizer=tokenizer,
         training={"steps": 0},

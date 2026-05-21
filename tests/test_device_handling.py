@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cmf import CMFConfig, FastParallelContinuousMeaningField
+from cmf import CMFConfig, ParallelContinuousMeaningField
 from cmf.data import ByteTokenizer
 from cmf.experiments import benchmark_forward
 from cmf.runtime import resolve_device
@@ -13,7 +13,7 @@ def test_resolve_device_cpu_is_explicit():
 
 
 def test_cpu_benchmark_does_not_require_cuda():
-    model = FastParallelContinuousMeaningField(
+    model = ParallelContinuousMeaningField(
         CMFConfig(vocab_size=32, d_model=8, hidden_dim=16, num_layers=1)
     )
     tokenizer = ByteTokenizer()

@@ -14,7 +14,6 @@ from .data import ByteTokenizer
 from .model import (
     ContinuousMeaningField,
     DeliberativeContinuousMeaningField,
-    FastParallelContinuousMeaningField,
     ParallelContinuousMeaningField,
 )
 from .tokenizer import SimpleBPETokenizer
@@ -26,7 +25,6 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "continuous_cmf": ContinuousMeaningField,
     "parallel_cmf": ParallelContinuousMeaningField,
     "deliberative_cmf": DeliberativeContinuousMeaningField,
-    "fast_parallel_cmf": FastParallelContinuousMeaningField,
     "tiny_gpt": TinyGPTLM,
 }
 
