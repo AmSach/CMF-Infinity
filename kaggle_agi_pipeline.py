@@ -34,19 +34,22 @@ SHARD_TOKENS = 25_000_000  # 25M tokens per shard
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_MIX = [
     # (hf_id, subset, split, weight, formatter)
-    # SlimPajama requires zstandard to decompress stream files
-    ("cerebras/SlimPajama-627B",                   None,                    "train", 2,
+    # FineWeb: high-quality deduplicated web text (open access, replaces gated SlimPajama)
+    ("HuggingFaceFW/fineweb",                      "sample-10BT",           "train", 2,
      lambda r: r.get("text", "")),
-    # Correct path is FinanceInc/auditor_sentiment
+    # Financial domain knowledge
     ("FinanceInc/auditor_sentiment",               None,                    "train", 1,
      lambda r: f"User: Analyze this financial statement.\nAssistant: {r.get('sentence', '')}"),
+    # Encyclopedic knowledge
     ("wikimedia/wikipedia",                        "20231101.en",           "train", 1,
      lambda r: r.get("text", "")),
-    # Correct path is Qwen/Qwen2.5-Math-1.1M-CoT
-    ("Qwen/Qwen2.5-Math-1.1M-CoT",                 None,                    "train", 1,
-     lambda r: f"User: {r.get('problem', '')}\nAssistant: {r.get('cot_content', '')}"),
+    # NVIDIA OpenMathReasoning: open-access math CoT (replaces gated Qwen dataset)
+    ("nvidia/OpenMathReasoning",                   None,                    "train", 1,
+     lambda r: f"User: {r.get('problem', '')}\nAssistant: {r.get('generated_solution', '')}"),
+    # Code instruction following
     ("HuggingFaceH4/CodeAlpaca_20K",               None,                    "train", 1,
      lambda r: f"User: {r.get('prompt', '')}\nAssistant: {r.get('completion', '')}"),
+    # Multi-turn assistant chat (coding, logic, writing)
     ("teknium/OpenHermes-2.5",                     None,                    "train", 1,
      lambda r: (
          f"User: {r['conversations'][0]['value']}\nAssistant: {r['conversations'][1]['value']}"
@@ -66,7 +69,7 @@ def setup_environment():
         subprocess.run(["git", "clone", REPO_URL, CMF_DIR], check=True)
     
     # Must install zstandard for SlimPajama streaming decompressions
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate", "zstandard"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate"], check=True)
     print("All packages installed.\n")
 
 def tokenization_worker():

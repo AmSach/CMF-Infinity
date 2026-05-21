@@ -616,6 +616,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
         if return_states:
             # If returning states is requested, we do it in eager mode since checkpointing isn't needed
             actual_steps = 0
+            ponder_loss = torch.tensor(0.0, device=z.device)
             for step_idx in range(steps):
                 tau_value = (step_idx + 0.5) / float(steps)
                 tau = torch.full(
@@ -635,6 +636,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 halt_means.append(halt_prob.mean())
                 actual_steps = step_idx + 1
                 states.append(z)
+        else:
             # High-performance grouped deliberation (95% faster autograd loop)
             # Pass all tensor closures explicitly as inputs to enable correct gradient tracking under checkpointing
             def run_deliberation(z_val, context_val, flat_context_val, flat_goal_val):
