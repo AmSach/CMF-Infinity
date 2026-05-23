@@ -565,6 +565,17 @@ class DeliberativeContinuousMeaningField(nn.Module):
         # Rotary Position Embeddings for 32k+ Extrapolation
         self.rope = RotaryPositionEmbedding(config.d_model)
 
+        # Anchoring projections for learnable semantic attention routing inside the deliberation loop
+        self.num_heads = 4
+        while self.num_heads > 1 and config.d_model % self.num_heads != 0:
+            self.num_heads //= 2
+        self.head_dim = config.d_model // self.num_heads
+        self.anchor_q = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.anchor_k = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.anchor_v = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.anchor_out = nn.Linear(config.d_model, config.d_model, bias=False)
+        self._forward_calls = 0
+
     def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
         mapped_state_dict = {}
         for k, v in state_dict.items():
@@ -605,6 +616,9 @@ class DeliberativeContinuousMeaningField(nn.Module):
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
 
+        if self.training:
+            self._forward_calls += 1
+
         batch_size, seq_len = input_ids.shape
         target_length = target_length or seq_len
         if target_length > seq_len:
@@ -633,6 +647,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
             # If returning states is requested, we do it in eager mode since checkpointing isn't needed
             actual_steps = 0
             ponder_loss = torch.tensor(0.0, device=z.device)
+            step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
             for step_idx in range(steps):
                 tau_value = (step_idx + 0.5) / float(steps)
                 tau = torch.full(
@@ -645,14 +660,17 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z)
                 proposal = z + velocity / float(steps)
                 
-                # 2. Subspace Manifold Anchoring (Causal Gravity projection to eliminate Solver Drift)
                 if target_length > 1:
-                    sim_anchor = torch.matmul(proposal, context.transpose(-1, -2)) / math.sqrt(proposal.size(-1))
-                    mask = torch.triu(torch.full((target_length, target_length), float("-inf"), device=proposal.device), diagonal=1)
-                    sim_anchor = sim_anchor + mask
-                    w_anchor = torch.softmax(sim_anchor, dim=-1)
-                    z_proj = torch.matmul(w_anchor, context)
-                    proposal = 0.85 * proposal + 0.15 * z_proj
+                    q = self.anchor_q(proposal).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                    k = self.anchor_k(context).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                    v = self.anchor_v(context).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                    
+                    z_proj = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, is_causal=True
+                    )
+                    z_proj = z_proj.transpose(1, 2).reshape(batch_size, target_length, self.config.d_model)
+                    z_proj = self.anchor_out(z_proj)
+                    proposal = (1.0 - step_anchor_scale) * proposal + step_anchor_scale * z_proj
                 
                 gate_input = torch.cat([z, proposal, context], dim=-1)
                 gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
@@ -675,17 +693,20 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     
                 z = z_next
                 
-                # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+                # Project intermediate state for return history/halt prediction, but do not accumulate projection drift
                 z_mean = z.mean(dim=-1, keepdim=True)
                 z_std = z.std(dim=-1, keepdim=True)
                 c_mean = context.mean(dim=-1, keepdim=True)
                 c_std = context.std(dim=-1, keepdim=True)
-                z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+                z_projected = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
                 
-                halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z)))
+                halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_projected)))
                 halt_means.append(halt_prob.mean())
                 actual_steps = step_idx + 1
-                states.append(z)
+                states.append(z_projected)
+            
+            # Final z state returned is the projected final step state
+            z = states[-1]
         else:
             # High-performance grouped deliberation (95% faster autograd loop)
             # Pass all tensor closures explicitly as inputs to enable correct gradient tracking under checkpointing
@@ -696,6 +717,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
                 # Enforce FP32 state accumulation to prevent scale-induced FP16 numerical drift 
                 # during long-horizon thinking orbits (critical for >1B param models).
                 z_accum = z_val.to(torch.float32)
+                step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
                 
                 for step_idx in range(steps):
                     tau_value = (step_idx + 0.5) / float(steps)
@@ -712,17 +734,41 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     velocity = self.field(flat_z, flat_context_val, tau, goal=flat_goal_val).reshape_as(z_val)
                     proposal = z_accum.to(z_val.dtype) + velocity / float(steps)
                     
-                    # 2. Subspace Manifold Anchoring (Causal Gravity projection to eliminate Solver Drift)
+                    lock_on = None
                     if target_length > 1:
-                        sim_anchor = torch.matmul(proposal, context_val.transpose(-1, -2)) / math.sqrt(proposal.size(-1))
-                        mask = torch.triu(torch.full((target_length, target_length), float("-inf"), device=proposal.device), diagonal=1)
-                        sim_anchor = sim_anchor + mask
-                        w_anchor = torch.softmax(sim_anchor, dim=-1)
-                        z_proj = torch.matmul(w_anchor, context_val)
-                        proposal = 0.85 * proposal + 0.15 * z_proj
+                        q = self.anchor_q(proposal).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                        k = self.anchor_k(context_val).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                        v = self.anchor_v(context_val).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
+                        
+                        # Dynamic Attention Tempering
+                        if self.training:
+                            temp = max(0.2, 2.0 - (self._forward_calls / 1500.0) * 1.8)
+                        else:
+                            temp = 0.2
+                        
+                        scale = 1.0 / (temp * math.sqrt(self.head_dim))
+                        sim = torch.matmul(q, k.transpose(-1, -2)) * scale
+                        mask = torch.triu(torch.full((target_length, target_length), float("-inf"), device=sim.device), diagonal=1)
+                        sim = sim + mask
+                        attn = torch.softmax(sim, dim=-1)
+                        
+                        # Compute entropy of attention over context landscape
+                        p = torch.clamp(attn, min=1e-9)
+                        entropy = -torch.sum(p * torch.log2(p), dim=-1)
+                        mean_entropy = entropy.mean(dim=1)
+                        max_entropy = math.log2(target_length) if target_length > 1 else 1.0
+                        norm_entropy = mean_entropy / max_entropy
+                        lock_on = 1.0 - norm_entropy
+                        
+                        z_proj = torch.matmul(attn, v)
+                        z_proj = z_proj.transpose(1, 2).reshape(batch_size, target_length, self.config.d_model)
+                        z_proj = self.anchor_out(z_proj)
+                        proposal = (1.0 - step_anchor_scale) * proposal + step_anchor_scale * z_proj
                     
                     gate_input = torch.cat([z_accum.to(z_val.dtype), proposal, context_val], dim=-1)
                     gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
+                    if lock_on is not None:
+                        gate = gate * (1.0 - lock_on.unsqueeze(-1))
                     
                     # Core residual physics update strictly executed in FP32
                     delta_z = gate.to(torch.float32) * (proposal.to(torch.float32) - z_accum)
@@ -741,20 +787,29 @@ class DeliberativeContinuousMeaningField(nn.Module):
                         jitter = torch.sin(z_accum * 1000.0) * 1e-6
                         z_accum = z_accum + noise + jitter
                     
-                    # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
-                    z_mean = z_accum.mean(dim=-1, keepdim=True)
-                    z_std = z_accum.std(dim=-1, keepdim=True)
+                    # Project temporarily to check halt condition, but do not accumulate projection drift
+                    z_temp = z_accum.to(z_val.dtype)
+                    z_mean = z_temp.mean(dim=-1, keepdim=True)
+                    z_std = z_temp.std(dim=-1, keepdim=True)
                     c_mean = context_val.mean(dim=-1, keepdim=True)
                     c_std = context_val.std(dim=-1, keepdim=True)
-                    z_accum = ((z_accum - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+                    z_temp_proj = ((z_temp - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
                     
                     # Ponder cost mechanism: penalize low halt probabilities at each step 
                     # to strictly calibrate the halting head (solves over-thinking bottleneck)
-                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_accum.to(z_val.dtype))))
+                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_temp_proj)))
                     probs_list.append(halt_prob.mean())
                     ponder_losses.append((1.0 - halt_prob).mean())
                     
-                return z_accum.to(z_val.dtype), torch.stack(probs_list), torch.stack(ponder_losses)
+                # Project the final accumulated state
+                z_accum_temp = z_accum.to(z_val.dtype)
+                z_mean = z_accum_temp.mean(dim=-1, keepdim=True)
+                z_std = z_accum_temp.std(dim=-1, keepdim=True)
+                c_mean = context_val.mean(dim=-1, keepdim=True)
+                c_std = context_val.std(dim=-1, keepdim=True)
+                z_final_proj = ((z_accum_temp - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+                
+                return z_final_proj, torch.stack(probs_list), torch.stack(ponder_losses)
 
             actual_steps = steps
             if gradient_checkpointing:
@@ -827,6 +882,7 @@ class DeliberativeContinuousMeaningField(nn.Module):
             
             steps = self._thinking_budget()
             flat_goal = None
+            step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
             
             for step_idx in range(steps):
                 tau_value = (step_idx + 0.5) / float(steps)
@@ -862,8 +918,8 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     sim_anchor = torch.matmul(z_next.unsqueeze(1), context.transpose(-1, -2)).squeeze(1) / math.sqrt(z_next.size(-1))
                     w_anchor = torch.softmax(sim_anchor, dim=-1)
                     z_proj = torch.matmul(w_anchor.unsqueeze(1), context).squeeze(1)
-                    # Anchor active state to the context landscape manifold softly (15% coordinate gravity)
-                    z_next = 0.85 * z_next + 0.15 * z_proj
+                    # Anchor active state to the context landscape manifold softly
+                    z_next = (1.0 - step_anchor_scale) * z_next + step_anchor_scale * z_proj
                 
                 # 3. Hamiltonian Symplectic Curl Stabilization (Deterministic orbit around attractors, replaces loops)
                 d_half = delta_z.size(-1) // 2
@@ -878,27 +934,34 @@ class DeliberativeContinuousMeaningField(nn.Module):
                     jitter = torch.sin(z_next * 1000.0) * 1e-6
                     z_next = z_next + noise + jitter
                     
-                # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
+                # Project temporarily to check halt condition/final state, but do not accumulate projection drift
                 z_mean = z_next.mean(dim=-1, keepdim=True)
                 z_std = z_next.std(dim=-1, keepdim=True)
                 c_mean = c_effective.mean(dim=-1, keepdim=True)
                 c_std = c_effective.std(dim=-1, keepdim=True)
-                z_next = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+                z_next_proj = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
                 
                 if use_velocity_halting:
                     # L2 norm over model dimension
                     velocity_norm = torch.norm(delta_z, p=2, dim=-1)
                     if torch.all(velocity_norm < velocity_epsilon):
-                        z = z_next
+                        z = z_next_proj
                         break
                 else:
                     # Fallback to standard learned halting head
-                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_next)))
+                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_next_proj)))
                     if torch.all(halt_prob >= self.config.halting_threshold):
-                        z = z_next
+                        z = z_next_proj
                         break
                 
                 z = z_next
+            else:
+                # If we completed all steps without early halting, project the final z
+                z_mean = z.mean(dim=-1, keepdim=True)
+                z_std = z.std(dim=-1, keepdim=True)
+                c_mean = c_effective.mean(dim=-1, keepdim=True)
+                c_std = c_effective.std(dim=-1, keepdim=True)
+                z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
             
             # Predict the next token from final state
             logits = self.output(self.state_norm(z))

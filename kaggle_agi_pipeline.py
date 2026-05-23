@@ -69,13 +69,32 @@ def setup_environment():
         print(f"Cloning codebase from {REPO_URL}...")
         subprocess.run(["git", "clone", REPO_URL, CMF_DIR], check=True)
     
-    # Must install zstandard for SlimPajama streaming decompressions
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "transformers", "tiktoken", "accelerate"], check=True)
+    # Check GPU visibility first
+    try:
+        import torch
+        print("CUDA available:", torch.cuda.is_available())
+        print("Number of GPUs detected:", torch.cuda.device_count())
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        else:
+            print("\n" + "!"*80)
+            print("CRITICAL WARNING: CUDA GPU IS NOT VISIBLE TO PYTORCH!")
+            print("Please ensure that you have selected a GPU accelerator (e.g., 'GPU T4 x2')")
+            print("in the Kaggle notebook settings sidebar under Accelerator.")
+            print("!"*80 + "\n")
+    except Exception as e:
+        print(f"GPU Detection Warning: {e}")
+        
+    # Install dependencies without upgrading torch/torchvision to protect CUDA driver bindings
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "zstandard", "tiktoken"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "datasets", "transformers", "accelerate"], check=True)
     print("All packages installed.\n")
 
 def tokenization_worker():
     """Background worker that streams directly from HF, tokenizes, and saves shards.
-    Uses a single-threaded round-robin approach with active garbage collection to minimize RAM usage.
+    To minimize RAM usage, it processes one dataset at a time, batches tokenization,
+    and runs aggressive garbage collection.
     """
     print("=" * 60)
     print("1. Background Tokenizer Initializing")
@@ -87,25 +106,6 @@ def tokenization_worker():
     os.makedirs(CACHE_DIR, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     eos_id = tokenizer.eos_token_id
-
-    # Initialize streams in a single thread to save network socket and buffer memory
-    iterators = []
-    for hf_id, subset, split, weight, fmt in DATASET_MIX:
-        try:
-            kwargs = {"split": split, "streaming": True}
-            if subset:
-                it = iter(load_dataset(hf_id, subset, **kwargs))
-            else:
-                it = iter(load_dataset(hf_id, **kwargs))
-            iterators.append((it, fmt, weight, hf_id))
-        except Exception as e:
-            print(f"Warning: Failed to load dataset {hf_id}: {e}")
-
-    if not iterators:
-        print("Error: No datasets successfully loaded. Aborting background tokenizer.")
-        return
-
-    print(f"[Tokenizer] Active round-robin stream loaded. Preparing shards...")
 
     tokens_seen = 0
     shard_idx = 0
@@ -143,35 +143,71 @@ def tokenization_worker():
         gc.collect()
         return toks[SHARD_TOKENS:]
 
-    active_iterators = list(iterators)
-    
-    while active_iterators and tokens_seen < TARGET_TOKENS:
-        next_active = []
-        for it, fmt, weight, hf_id in active_iterators:
-            try:
-                # Retrieve records based on the dataset ratio weight
-                for _ in range(weight):
+    # List of datasets to iterate sequentially
+    datasets_list = []
+    for hf_id, subset, split, weight, fmt in DATASET_MIX:
+        for _ in range(weight):
+            datasets_list.append((hf_id, subset, split, fmt))
+
+    dataset_idx = 0
+    while tokens_seen < TARGET_TOKENS and datasets_list:
+        hf_id, subset, split, fmt = datasets_list[dataset_idx % len(datasets_list)]
+        print(f"[Tokenizer] Opening dataset stream: {hf_id} ({split})")
+        
+        try:
+            kwargs = {"split": split, "streaming": True}
+            if subset:
+                ds = load_dataset(hf_id, subset, **kwargs)
+            else:
+                ds = load_dataset(hf_id, **kwargs)
+                
+            it = iter(ds)
+            
+            # Read a batch of records (e.g. 5,000,000 tokens worth) to keep RAM footprint low
+            target_batch_tokens = 5_000_000
+            batch_tokens = 0
+            batch_texts = []
+            
+            while batch_tokens < target_batch_tokens and tokens_seen < TARGET_TOKENS:
+                try:
                     row = next(it)
                     text = fmt(row)
                     if text and text.strip():
-                        encoded = tokenizer.encode(text, add_special_tokens=False) + [eos_id]
-                        buffer.extend(encoded)
-                        tokens_seen += len(encoded)
+                        batch_texts.append(text)
+                        batch_tokens += len(text.split())
+                except StopIteration:
+                    break
+                except Exception as e:
+                    print(f"[Tokenizer] Stream read warning: {e}")
+                    time.sleep(1.0)
+                    
+            if batch_texts:
+                # Fast batched tokenization
+                encoded_batch = tokenizer(batch_texts, add_special_tokens=False)
+                for enc in encoded_batch["input_ids"]:
+                    buffer.extend(enc)
+                    buffer.append(eos_id)
+                    tokens_seen += len(enc) + 1
+                    
+                while len(buffer) >= SHARD_TOKENS:
+                    buffer = save_shard(buffer, shard_idx)
+                    shard_idx += 1
+                    
+            # Delete references and collect garbage to free Arrow/HTTP cache memory
+            del it
+            del ds
+            del batch_texts
+            del encoded_batch
+            gc.collect()
+            
+        except Exception as e:
+            print(f"[Tokenizer] Failed to process dataset {hf_id}: {e}")
+            time.sleep(2.0)
+            
+        dataset_idx += 1
 
-                        while len(buffer) >= SHARD_TOKENS:
-                            buffer = save_shard(buffer, shard_idx)
-                            shard_idx += 1
-                next_active.append((it, fmt, weight, hf_id))
-            except StopIteration:
-                print(f"[Tokenizer] Dataset {hf_id} fully consumed.")
-            except Exception as e:
-                # If there's a temporary connection hiccup, retain the stream
-                next_active.append((it, fmt, weight, hf_id))
-                time.sleep(0.5)
-        
-        active_iterators = next_active
-
-    if buffer and tokens_seen < TARGET_TOKENS:
+    # Save remaining tokens
+    if buffer:
         save_shard(buffer, shard_idx)
         shard_idx += 1
 
