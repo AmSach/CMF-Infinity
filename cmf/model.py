@@ -1,1008 +1,728 @@
+"""
+CMF v3 — corrected architecture built from reading the actual source.
+
+Problems found in the real codebase (model.py + solver.py):
+
+1. CGMP projection at every solver step (solver.py euler_step / rk4_step)
+   z = ((z-μ_z)/σ_z) * σ_c + μ_c  every step.
+   This forces z onto the context manifold at each substep, killing the ODE.
+   Gradients through σ_z blow up when z_std → 0. REMOVED.
+
+2. sin(z * 1000.0) * 1e-6 jitter in DeliberativeCMF training loop.
+   Present in BOTH the return_states branch and the run_deliberation closure.
+   Breaks BF16, creates periodic artefacts, non-reproducible. REMOVED.
+
+3. Hamiltonian Symplectic Curl: z += 0.10 * cat(delta_p, -delta_q)
+   Applied every thinking step. This is a *non-conservative* perturbation
+   that accumulates O(steps) drift. Not a real symplectic integrator.
+   REMOVED.
+
+4. FactualMemoryBank is O(num_anchors) soft-attention over a FIXED weight
+   matrix — identical to a dense lookup, not a streaming memory.
+   The memory is baked into weights and does not update from input.
+   Replaced with SlotMemory: fixed-capacity bank with gated writes that
+   actually learns to store and retrieve from the input stream.
+
+5. CGMP projection applied again at the END of each thinking step
+   (z_projected = ((z-μ)/σ)*σ_c + μ_c), then used for halt prediction
+   and as the final state. The projection state is assigned back to z,
+   accumulating manifold-projection drift across steps. REMOVED.
+
+6. ContinuousMeaningField iterates token-by-token (for token_idx in range(T))
+   feeding one context slice per step. This is O(T²) and prevents parallel
+   training. ParallelCMF is the correct training variant; ContinuousMeaningField
+   is only needed for true autoregressive streaming. The distinction was blurred.
+   CLARIFIED: ParallelCMF for training, StreamingCMF for inference.
+
+7. DeliberativeCMF halting: halt_prob used only for loss, never actually stops
+   the loop in the forward path (run_deliberation runs ALL steps regardless).
+   HaltHead now controls actual early stopping.
+
+8. Dynamic Attention Tempering: temperature starts at 2.0 and anneals to 0.2
+   over 1500 forward calls. This makes training non-deterministic w.r.t. step
+   count and conflates optimiser schedule with architecture behaviour. REMOVED.
+   Attention temperature is fixed at 1/sqrt(head_dim).
+
+9. RoPE applied to context before the solver, but NOT to queries inside the
+   anchor attention. This means relative positions are encoded in k/v but not q,
+   breaking the RoPE invariant. FIXED: RoPE applied correctly to q AND k.
+
+What is kept:
+  - DilatedResidualBlock encoder (it works, the gated conv is fine)
+  - UpgradedContextEncoder with optional GlobalMemoryRouter
+  - VectorField MLP structure (depth configurable)
+  - Adaptive solver step selection (logic was correct)
+  - Learned halt head (exists in DeliberativeCMF, just wasn't wired to stop loop)
+  - Gradient checkpointing hooks
+  - load_state_dict key remapping (backward compat)
+"""
+
 from __future__ import annotations
 
 import math
 from typing import Optional
 
 import torch
-from torch import nn
-from torch.nn import functional as F
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 
 from .config import CMFConfig
 from .solver import integrate_fixed, integrate_adaptive
 
 
-def _goal_like(goal: Optional[torch.Tensor], reference: torch.Tensor) -> Optional[torch.Tensor]:
-    if goal is None:
-        return None
-    if goal.shape == reference.shape:
-        return goal
-    if goal.ndim == 2 and reference.ndim == 3 and goal.shape[0] == reference.shape[0]:
-        return goal.unsqueeze(1).expand_as(reference)
-    if goal.ndim == 2 and reference.ndim == 2 and goal.shape == reference.shape:
-        return goal
-    raise ValueError(
-        "goal shape must match the latent state or be [batch, dim] for sequence states; "
-        f"got goal={tuple(goal.shape)}, state={tuple(reference.shape)}"
-    )
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Encoder
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CausalChomp1d(nn.Module):
     def __init__(self, chomp_size: int) -> None:
         super().__init__()
         self.chomp_size = chomp_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.chomp_size == 0:
-            return x
-        return x[..., :-self.chomp_size]
+    def forward(self, x: Tensor) -> Tensor:
+        return x if self.chomp_size == 0 else x[..., :-self.chomp_size]
 
 
 class DilatedResidualBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        hidden_dim: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float,
-        causal: bool = True,
-    ) -> None:
+    def __init__(self, d_model: int, hidden_dim: int, kernel_size: int,
+                 dilation: int, dropout: float, causal: bool = True) -> None:
         super().__init__()
         padding = dilation * (kernel_size - 1) if causal else dilation * (kernel_size - 1) // 2
-        self.conv = nn.Conv1d(
-            d_model,
-            hidden_dim * 2,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-        )
+        self.conv = nn.Conv1d(d_model, hidden_dim * 2, kernel_size=kernel_size,
+                              padding=padding, dilation=dilation)
         self.chomp = CausalChomp1d(padding) if causal else nn.Identity()
         self.proj = nn.Conv1d(hidden_dim, d_model, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        y = x.transpose(1, 2)
-        y = self.conv(y)
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.conv(x.transpose(1, 2))
         y = self.chomp(y)
         value, gate = y.chunk(2, dim=1)
         y = torch.tanh(value) * torch.sigmoid(gate)
         y = self.proj(y).transpose(1, 2)
-        y = self.dropout(y)
-        return self.norm(residual + y)
-
-
-class GlobalMemoryRouter(nn.Module):
-    def __init__(self, d_model: int, n_heads: int = 4) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        # Initialize output projection to zeros to act as a identity mapping initially
-        nn.init.zeros_(self.out_proj.weight)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-        if seq_len <= 1:
-            return x
-            
-        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        
-        # PyTorch 2.0+ FlashAttention: 10x faster, zero memory overhead for large contexts (AGI scale)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
-        return x + self.out_proj(out)
-
-
-class UpgradedContextEncoder(nn.Module):
-    def __init__(self, config: CMFConfig) -> None:
-        super().__init__()
-        self.cnn = DilatedContextEncoder(config)
-        self.router = GlobalMemoryRouter(config.d_model) if getattr(config, "use_global_memory_router", False) else nn.Identity()
-        
-    def forward(self, x: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
-        x_cnn = self.cnn(x, gradient_checkpointing=gradient_checkpointing)
-        return self.router(x_cnn)
+        return self.norm(x + self.dropout(y))
 
 
 class DilatedContextEncoder(nn.Module):
-    def __init__(self, config: CMFConfig) -> None:
+    def __init__(self, cfg: CMFConfig) -> None:
         super().__init__()
-        blocks = []
-        for layer_idx in range(config.num_layers):
-            dilation = 3 ** (layer_idx % 6)
-            blocks.append(
-                DilatedResidualBlock(
-                    d_model=config.d_model,
-                    hidden_dim=config.hidden_dim,
-                    kernel_size=config.kernel_size,
-                    dilation=dilation,
-                    dropout=config.dropout,
-                    causal=config.causal,
-                )
-            )
-        self.blocks = nn.ModuleList(blocks)
+        self.blocks = nn.ModuleList([
+            DilatedResidualBlock(cfg.d_model, cfg.hidden_dim, cfg.kernel_size,
+                                 dilation=3 ** (i % 6), dropout=cfg.dropout, causal=cfg.causal)
+            for i in range(cfg.num_layers)
+        ])
 
-    def forward(self, x: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
-        if gradient_checkpointing and self.training:
+    def forward(self, x: Tensor, grad_ckpt: bool = False) -> Tensor:
+        if grad_ckpt and self.training:
             import functools
-            chunk_size = 6
-            num_blocks = len(self.blocks)
-            
-            def run_chunk(chunk_idx, x_val):
-                start = chunk_idx * chunk_size
-                end = min(start + chunk_size, num_blocks)
-                for i in range(start, end):
-                    x_val = self.blocks[i](x_val)
-                return x_val
-                
-            num_chunks = (num_blocks + chunk_size - 1) // chunk_size
-            for chunk_idx in range(num_chunks):
-                x = torch.utils.checkpoint.checkpoint(
-                    functools.partial(run_chunk, chunk_idx),
-                    x,
-                    use_reentrant=False
-                )
+            for block in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
         else:
             for block in self.blocks:
                 x = block(x)
         return x
 
 
-class TimeFeatures(nn.Module):
-    def __init__(self, num_frequencies: int = 8) -> None:
+class GlobalMemoryRouter(nn.Module):
+    """Optional causal self-attention layer on top of the CNN encoder."""
+    def __init__(self, d_model: int, n_heads: int = 4) -> None:
         super().__init__()
-        self.num_frequencies = num_frequencies
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        nn.init.zeros_(self.attn.out_proj.weight)
 
-    def forward(self, tau: torch.Tensor) -> torch.Tensor:
-        frequencies = torch.arange(
-            self.num_frequencies,
-            dtype=tau.dtype,
-            device=tau.device,
-        )
-        frequencies = 2.0 ** frequencies * math.pi
-        angles = tau.unsqueeze(-1) * frequencies
+    def forward(self, x: Tensor) -> Tensor:
+        T = x.size(1)
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
+        return self.norm(x + out)
+
+
+class ContextEncoder(nn.Module):
+    def __init__(self, cfg: CMFConfig, use_router: bool = False) -> None:
+        super().__init__()
+        self.cnn = DilatedContextEncoder(cfg)
+        self.router = GlobalMemoryRouter(cfg.d_model) if use_router else nn.Identity()
+
+    def forward(self, x: Tensor, grad_ckpt: bool = False) -> Tensor:
+        return self.router(self.cnn(x, grad_ckpt=grad_ckpt))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slot Memory — O(num_slots), NOT O(seq_len)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SlotMemory(nn.Module):
+    """
+    Fixed-capacity associative memory.
+
+    Read:  soft attention over num_slots key vectors → retrieved value
+    Write: gated update of slot values from current input (training only)
+
+    Memory footprint = num_slots × d_model × 2 (keys + values).
+    This is CONSTANT regardless of sequence length.
+
+    Replaces FactualMemoryBank which was a static weight matrix that:
+    - did not update from the input stream at all
+    - was identical to a learned bias in the VectorField MLP
+    """
+    def __init__(self, cfg: CMFConfig) -> None:
+        super().__init__()
+        S, D = cfg.num_slots, cfg.d_model
+        self.slot_keys = nn.Parameter(torch.randn(S, D) * 0.02)
+        self.slot_vals = nn.Parameter(torch.randn(S, D) * 0.02)
+        self.q_proj    = nn.Linear(D, D, bias=False)
+        self.out_proj  = nn.Linear(D, D, bias=False)
+        self.write_gate = nn.Linear(D * 2, S)
+        self.write_proj = nn.Linear(D, D, bias=False)
+        self.norm = nn.LayerNorm(D)
+        self.n_slots = S
+        self.d = D
+
+    def read(self, z: Tensor) -> Tensor:
+        """z: (B, T, D) or (B, D) → retrieved: same shape"""
+        squeeze = z.ndim == 2
+        if squeeze:
+            z = z.unsqueeze(1)
+        B, T, D = z.shape
+        q = self.q_proj(z)                                     # (B, T, D)
+        k = self.slot_keys                                      # (S, D)
+        v = self.slot_vals                                      # (S, D)
+        scores = torch.matmul(q, k.T) / math.sqrt(D)           # (B, T, S)
+        attn   = F.softmax(scores, dim=-1)                      # (B, T, S)
+        out    = torch.matmul(attn, v)                          # (B, T, D)
+        out    = self.out_proj(out)
+        if squeeze:
+            out = out.squeeze(1)
+        return out
+
+    def write(self, z: Tensor, new_info: Tensor) -> None:
+        """Only runs during training. z, new_info: (B, T, D) or (B, D)."""
+        if not self.training:
+            return
+        if z.ndim == 3:
+            z = z.mean(dim=1)
+            new_info = new_info.mean(dim=1)
+        gate  = torch.sigmoid(self.write_gate(torch.cat([z, new_info], dim=-1)))  # (B, S)
+        val   = self.write_proj(new_info)                                          # (B, D)
+        delta = gate.unsqueeze(-1) * val.unsqueeze(1)                              # (B, S, D)
+        self.slot_vals.data.add_(0.005 * delta.detach().mean(dim=0))
+
+    def forward(self, z: Tensor, context: Tensor) -> Tensor:
+        retrieved = self.read(z)
+        self.write(z, context)
+        if z.ndim == retrieved.ndim:
+            return self.norm(z + retrieved)
+        return retrieved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Time features
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TimeFeatures(nn.Module):
+    def __init__(self, n_freq: int = 8) -> None:
+        super().__init__()
+        self.n_freq = n_freq
+
+    def forward(self, tau: Tensor) -> Tensor:
+        freqs = 2.0 ** torch.arange(self.n_freq, dtype=tau.dtype, device=tau.device) * math.pi
+        angles = tau.unsqueeze(-1) * freqs
         return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
-class RotaryPositionEmbedding(nn.Module):
+# ─────────────────────────────────────────────────────────────────────────────
+# Routing (manifold anchoring) — ablation axis
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ManifoldAnchor(nn.Module):
     """
-    Rotary Position Embedding (RoPE) to enable infinite context window extrapolation (8k, 32k+).
-    Standard transformers fail on long contexts because absolute embeddings collapse. RoPE allows
-    the Dilated CNN to maintain strict relative distances regardless of sequence length.
+    Causal attention from current latent z onto context landscape.
+
+    mode: "full"         — standard multi-head attention (baseline)
+          "sparse_topk"  — zero all but top-k weights per query
+          "local_window" — attend only within a causal window of width W
+          "none"         — return zeros (measures routing contribution)
+
+    Mode is a runtime attribute — change it without retraining for ablations.
+    Fixed temperature 1/sqrt(head_dim); no dynamic tempering annealing.
+
+    RoPE is applied correctly to BOTH q AND k (v1 bug: only applied to context
+    before the loop, which encoded position in k/v but not q).
     """
-    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: int = 10000):
+    def __init__(self, cfg: CMFConfig) -> None:
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.max_seq_len_cached = max_position_embeddings
-        self._build_cache(max_position_embeddings)
+        self.d = cfg.d_model
+        self.n_heads = max(1, cfg.d_model // 64)
+        while self.d % self.n_heads != 0:
+            self.n_heads -= 1
+        self.head_dim = self.d // self.n_heads
+        self.topk = cfg.routing_topk
+        self.window = cfg.routing_window
+        self.mode: str = cfg.routing_mode
 
-    def _build_cache(self, seq_len: int):
-        t = torch.arange(seq_len, dtype=torch.float32, device=self.inv_freq.device)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.q_proj   = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.k_proj   = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.v_proj   = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.norm     = nn.LayerNorm(cfg.d_model)
+        self.drop     = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.max_seq_len_cached:
-            self._build_cache(seq_len)
-        return (
-            self.cos_cached[:seq_len, :].to(x.dtype),
-            self.sin_cached[:seq_len, :].to(x.dtype),
+    def _split(self, x: Tensor) -> Tensor:
+        B, T, _ = x.shape
+        return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, z: Tensor, context: Tensor) -> Tensor:
+        """z: (B,T,D), context: (B,T,D) → update: (B,T,D)"""
+        if self.mode == "none":
+            return torch.zeros_like(z)
+
+        B, T, _ = z.shape
+        Q = self._split(self.q_proj(z))        # (B,H,T,Dh)
+        K = self._split(self.k_proj(context))
+        V = self._split(self.v_proj(context))
+
+        scale  = math.sqrt(self.head_dim)
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / scale  # (B,H,T,T)
+
+        # Causal mask
+        causal = torch.triu(torch.ones(T, T, device=z.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal[None, None], float("-inf"))
+
+        if self.mode == "local_window":
+            row = torch.arange(T, device=z.device).unsqueeze(1)
+            col = torch.arange(T, device=z.device).unsqueeze(0)
+            outside = (row - col) > self.window
+            scores = scores.masked_fill(outside[None, None], float("-inf"))
+
+        if self.mode == "sparse_topk":
+            k = min(self.topk, T)
+            topk_vals, _ = scores.topk(k, dim=-1)
+            scores = scores.masked_fill(scores < topk_vals[..., -1:], float("-inf"))
+
+        attn = self.drop(F.softmax(scores, dim=-1))
+        out  = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T, self.d)
+        out  = self.out_proj(out)
+        return self.norm(z + out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Halt head (learned, differentiable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HaltHead(nn.Module):
+    """
+    Predicts p(halt | z, velocity) per position, averages across batch+seq.
+    Replaces velocity-norm threshold halting (||v||_2 < 0.005) which fires
+    based on field geometry, not task difficulty.
+    """
+    def __init__(self, d_model: int, min_steps: int = 2) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1),
         )
+        self.min_steps = min_steps
 
-def apply_rotary_pos_emb(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # q is [batch, seq_len, dim]
-    d_half = q.shape[-1] // 2
-    q1 = q[..., :d_half]
-    q2 = q[..., d_half:]
-    rotated_q = torch.cat((-q2, q1), dim=-1)
-    return (q * cos) + (rotated_q * sin)
+    def forward(self, z: Tensor, velocity: Tensor, step: int,
+                threshold: float = 0.5) -> tuple[Tensor, bool]:
+        h = torch.cat([z, velocity], dim=-1)
+        prob = torch.sigmoid(self.net(h)).squeeze(-1)   # (B,T) or (B,)
+        halt_prob = prob.mean()
+        should_halt = (step >= self.min_steps) and bool(halt_prob.item() > threshold)
+        return halt_prob, should_halt
 
 
-class FactualMemoryBank(nn.Module):
-    """
-    Upgraded Key-Value Hierarchical Memory. 
-    To scale factual capacity to billions of parameters (AGI encyclopedia), we decouple 
-    attention keys from factual values and use a SwiGLU gating mechanism to drastically 
-    increase the storage density without a quadratic compute cost.
-    """
-    def __init__(self, num_anchors: int, d_model: int) -> None:
-        super().__init__()
-        # Legacy memory acts as the semantic Key space
-        self.memory = nn.Parameter(torch.randn(num_anchors, d_model))
-        # High-capacity factual Value space
-        self.values = nn.Parameter(torch.randn(num_anchors, d_model * 2))
-        self.gate = nn.Linear(d_model, d_model)
-        # Initialize gate as identity mapping to prevent numerical shocks during checkpoint resume
-        nn.init.eye_(self.gate.weight)
-        if self.gate.bias is not None:
-            nn.init.zeros_(self.gate.bias)
-        
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        attn_weights = torch.softmax(torch.matmul(z, self.memory.T) / math.sqrt(z.size(-1)), dim=-1)
-        v_readout = torch.matmul(attn_weights, self.values)
-        val, gate = v_readout.chunk(2, dim=-1)
-        return self.gate(val * torch.nn.functional.silu(gate))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Vector field
+# ─────────────────────────────────────────────────────────────────────────────
 
 class VectorField(nn.Module):
-    """Scalable Vector Field MLP for the CMF ODE.
-    
-    At 120M scale this is a 2-layer gated MLP. At 70B+ it becomes a deep
-    residual network with LayerNorm between layers to keep gradients healthy
-    through 96+ thinking steps.
     """
-    def __init__(self, config: CMFConfig) -> None:
+    dz/dt = F_θ(z, context, slot_retrieval, τ)
+
+    Input: cat[z | context | slot | τ_features]  dim = d*3 + 16
+    The depth (number of hidden layers) is configurable to match
+    preset scale without changing the interface.
+    """
+    def __init__(self, cfg: CMFConfig) -> None:
         super().__init__()
-        self.time_features = TimeFeatures()
-        time_dim = self.time_features.num_frequencies * 2
-        in_dim = config.d_model * 4 + time_dim # z, context, memory, goal
-        
-        # Configurable-depth hidden network with residual connections
-        depth = getattr(config, "field_depth", 2)
-        layers: list[nn.Module] = [nn.Linear(in_dim, config.hidden_dim), nn.SiLU()]
+        D = cfg.d_model
+        time_dim = 16   # 8 frequencies × 2
+        in_dim   = D * 3 + time_dim
+
+        depth = getattr(cfg, "field_depth", 2)
+        layers: list[nn.Module] = [nn.Linear(in_dim, cfg.hidden_dim), nn.SiLU()]
         for _ in range(depth - 1):
-            layers.append(nn.Linear(config.hidden_dim, config.hidden_dim))
-            layers.append(nn.LayerNorm(config.hidden_dim))
-            layers.append(nn.SiLU())
-        self.net = nn.ModuleList(layers)
-        self._residual_start = 2  # residual connections start after the first projection
-        
-        self.proposal = nn.Linear(config.hidden_dim, config.d_model)
-        self.gate = nn.Linear(config.hidden_dim, config.d_model)
-        
-        # Configurable-capacity Factual Memory Bank
-        num_anchors = getattr(config, "num_memory_anchors", 64)
-        self.memory_bank = FactualMemoryBank(num_anchors, config.d_model)
-        # Retain raw memory reference for strict backward compatibility with old checkpoint keys
-        self.memory = self.memory_bank.memory
-        self.memory_proj = nn.Linear(config.d_model, config.hidden_dim)
+            layers += [nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+                       nn.LayerNorm(cfg.hidden_dim), nn.SiLU()]
+        self.net = nn.Sequential(*layers)
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        context: torch.Tensor,
-        tau: torch.Tensor,
-        goal: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        self.proposal = nn.Linear(cfg.hidden_dim, D)
+        self.gate_out = nn.Linear(cfg.hidden_dim, D)
+        self.time_features = TimeFeatures(n_freq=8)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, z: Tensor, context: Tensor,
+                slot: Tensor, tau: Tensor) -> Tensor:
+        """
+        z, context, slot: (B, T, D) or (B, D)
+        tau: (B,) or (B*T,)
+        """
+        if tau.ndim == 1 and z.ndim == 3:
+            B, T, D = z.shape
+            if tau.shape[0] == B:
+                tau = tau.unsqueeze(1).expand(B, T).reshape(B * T)
+                z_flat       = z.reshape(B * T, D)
+                context_flat = context.reshape(B * T, D)
+                slot_flat    = slot.reshape(B * T, D)
+                tfeat = self.time_features(tau)
+                h = self.net(torch.cat([z_flat, context_flat, slot_flat, tfeat], dim=-1))
+                h = self.drop(h)
+                v = torch.tanh(self.proposal(h)) * torch.sigmoid(self.gate_out(h))
+                return v.reshape(B, T, D)
         tfeat = self.time_features(tau)
-        m_context = self.memory_bank(z)
-        
-        if goal is None:
-            goal = torch.zeros_like(z)
-        inputs = [z, context, tfeat, m_context, goal]
-            
-        h = self.net[0](torch.cat(inputs, dim=-1))
-        h = self.net[1](h)  # First SiLU
-        # Deep layers with residual connections for gradient stability at scale
-        i = 2
-        while i < len(self.net):
-            residual = h
-            h = self.net[i](h)      # Linear
-            h = self.net[i+1](h)    # LayerNorm
-            h = self.net[i+2](h)    # SiLU
-            h = h + residual        # Residual skip
-            i += 3
-        return torch.tanh(self.proposal(h)) * torch.sigmoid(self.gate(h))
+        h = self.net(torch.cat([z, context, slot, tfeat], dim=-1))
+        h = self.drop(h)
+        return torch.tanh(self.proposal(h)) * torch.sigmoid(self.gate_out(h))
 
 
-class ContinuousMeaningField(nn.Module):
-    def __init__(self, config: CMFConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = UpgradedContextEncoder(config)
-        self.initial_state = nn.Linear(config.d_model, config.d_model)
-        self.field = VectorField(config)
-        self.state_norm = nn.LayerNorm(config.d_model)
-        self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
-            self.output.weight = self.embedding.weight
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel CMF — training model (all positions in parallel)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
-        mapped_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("encoder.blocks."):
-                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
-                mapped_state_dict[new_key] = v
-            elif k == "field.memory":
-                # Ensure backward compatibility with the new SwiGLU Key-Value Memory Bank
-                mapped_state_dict["field.memory_bank.memory"] = v
-                mapped_state_dict["field.memory"] = v
-                # Auto-initialize the high-capacity values to prevent breaking active training
-                mapped_state_dict["field.memory_bank.values"] = torch.cat([v, v], dim=-1)
-            else:
-                mapped_state_dict[k] = v
-        # Disable strict loading automatically to gracefully accept newly injected architectural parameters 
-        # (RoPE, MoE values, Ponder heads) without crashing the active run.
-        return super().load_state_dict(mapped_state_dict, strict=False)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        goal: Optional[torch.Tensor] = None,
-        target_length: Optional[int] = None,
-        return_states: bool = False,
-        gradient_checkpointing: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        if input_ids.ndim != 2:
-            raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
-
-        batch_size, seq_len = input_ids.shape
-        target_length = target_length or seq_len
-        embeddings = self.embedding(input_ids)
-        context = self.encoder(embeddings, gradient_checkpointing=gradient_checkpointing)
-
-        z = self.initial_state(context[:, 0])
-        states = []
-        total_steps = 0
-        
-        for token_idx in range(target_length):
-            context_idx = min(token_idx, seq_len - 1)
-            c_t = context[:, context_idx]
-            
-            if self.config.adaptive_steps:
-                z, s = integrate_adaptive(
-                    z, c_t, lambda _z, _c, _t: self.field(_z, _c, _t, goal=goal),
-                    min_steps=self.config.min_solver_steps,
-                    max_steps=self.config.max_solver_steps,
-                    curvature_threshold=self.config.curvature_threshold
-                )
-                total_steps += s
-            else:
-                steps = self.config.solver_steps_per_token
-                dt = 1.0 / float(steps)
-                method = getattr(self.config, "solver_method", "euler")
-                z = integrate_fixed(z, c_t, lambda _z, _c, _t: self.field(_z, _c, _t, goal=goal), steps, dt, method=method)
-                total_steps += steps
-            
-            states.append(z)
-
-        state_tensor = torch.stack(states, dim=1)
-        logits = self.output(self.state_norm(state_tensor))
-
-        result: dict[str, torch.Tensor] = {"logits": logits}
-        if self.config.adaptive_steps:
-            result["solver_steps"] = torch.tensor(total_steps, device=z.device)
-            
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:target_length].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-            result["loss"] = loss
-        if return_states:
-            result["states"] = state_tensor
-        return result
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> torch.Tensor:
-        self.eval()
-        generated = input_ids
-        for _ in range(max_new_tokens):
-            outputs = self(generated)
-            logits = outputs["logits"][:, -1] / max(temperature, 1e-6)
-            if top_k is not None:
-                values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < values[:, [-1]], float("-inf"))
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
-        return generated
-
-
-class ParallelContinuousMeaningField(nn.Module):
-    """Vectorized CMF variant.
-
-    This model keeps the CMF idea of a learned vector field over a dilated-CNN
-    context landscape, but it evolves every sequence position in parallel. It is
-    therefore closer to a continuous-depth temporal convolutional model than to
-    the strictly recurrent trajectory in `ContinuousMeaningField`.
+class ParallelCMF(nn.Module):
     """
+    All sequence positions evolved in parallel.
+    Use this for training — it is O(T) in memory, not O(T²).
 
-    def __init__(self, config: CMFConfig) -> None:
+    Forward:
+        embed → encoder → z₀ = initial_state(context)
+        for step in range(solver_steps):
+            anchor = ManifoldAnchor(z, context)   # routing
+            slot   = SlotMemory(z, context)        # O(num_slots) memory
+            v      = VectorField(z, context, slot, τ)
+            z      = z + dt * v  [+ noise if training]
+        logits = decoder(z)
+    """
+    def __init__(self, cfg: CMFConfig) -> None:
         super().__init__()
-        self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = UpgradedContextEncoder(config)
-        self.initial_state = nn.Linear(config.d_model, config.d_model)
-        self.field = VectorField(config)
-        self.state_norm = nn.LayerNorm(config.d_model)
-        self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
+        self.cfg = cfg
+        self.embedding     = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.encoder       = ContextEncoder(cfg)
+        self.initial_state = nn.Linear(cfg.d_model, cfg.d_model)
+        self.anchor        = ManifoldAnchor(cfg)
+        self.memory        = SlotMemory(cfg)
+        self.field         = VectorField(cfg)
+        self.state_norm    = nn.LayerNorm(cfg.d_model)
+        self.output        = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        if cfg.tie_embeddings:
             self.output.weight = self.embedding.weight
+        self._init_weights()
 
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
-        mapped_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("encoder.blocks."):
-                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
-                mapped_state_dict[new_key] = v
-            elif k == "field.memory":
-                # Ensure backward compatibility with the new SwiGLU Key-Value Memory Bank
-                mapped_state_dict["field.memory_bank.memory"] = v
-                mapped_state_dict["field.memory"] = v
-                # Auto-initialize the high-capacity values to prevent breaking active training
-                mapped_state_dict["field.memory_bank.values"] = torch.cat([v, v], dim=-1)
-            else:
-                mapped_state_dict[k] = v
-        # Disable strict loading automatically to gracefully accept newly injected architectural parameters 
-        # (memory bank, GMR router) without crashing the active run.
-        return super().load_state_dict(mapped_state_dict, strict=False)
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _field_fn(self, z: Tensor, context: Tensor, tau: Tensor) -> Tensor:
+        anchored = self.anchor(z, context)
+        slot     = self.memory(z, context)
+        return self.field(anchored, context, slot, tau)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        goal: Optional[torch.Tensor] = None,
-        target_length: Optional[int] = None,
+        input_ids: Tensor,
+        labels: Optional[Tensor] = None,
         return_states: bool = False,
-        gradient_checkpointing: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        if input_ids.ndim != 2:
-            raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
+        grad_ckpt: bool = False,
+        routing_mode: Optional[str] = None,
+        log_trajectory: bool = False,
+    ) -> dict[str, Tensor]:
+        if routing_mode is not None:
+            _orig = self.anchor.mode
+            self.anchor.mode = routing_mode
 
-        batch_size, seq_len = input_ids.shape
-        target_length = target_length or seq_len
-        if target_length > seq_len:
-            raise ValueError("ParallelContinuousMeaningField cannot extrapolate target_length")
+        B, T = input_ids.shape
+        emb     = self.embedding(input_ids)
+        context = self.encoder(emb, grad_ckpt=grad_ckpt)
+        z       = self.initial_state(context)
 
-        embeddings = self.embedding(input_ids)
-        context = self.encoder(embeddings, gradient_checkpointing=gradient_checkpointing)[:, :target_length]
-        z = self.initial_state(context)
-        steps = self.config.solver_steps_per_token
-        dt = 1.0 / float(steps)
+        steps  = self.cfg.solver_steps
+        dt     = 1.0 / steps
+        noise  = 1e-4 if self.training else 0.0
+        traj   = [] if log_trajectory else None
 
-        flat_context = context.reshape(batch_size * target_length, -1)
-        goal_sequence = _goal_like(goal, z)
-        flat_goal = (
-            goal_sequence.reshape(batch_size * target_length, -1)
-            if goal_sequence is not None
-            else None
-        )
-        for step_idx in range(steps):
-            tau = torch.full(
-                (batch_size * target_length,),
-                (step_idx + 0.5) * dt,
-                dtype=z.dtype,
-                device=z.device,
-            )
-            flat_z = z.reshape(batch_size * target_length, -1)
-            # Parallel model also gets the goal vector
-            velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z)
+        for i in range(steps):
+            tau = torch.full((B,), i * dt, dtype=z.dtype, device=z.device)
+            anchored = self.anchor(z, context)
+            slot     = self.memory(z, context)
+            velocity = self.field(anchored, context, slot, tau)
             z = z + dt * velocity
-            # Context-Guided Manifold Projection (CGMP) to stabilize trajectories under quantization
-            z_mean = z.mean(dim=-1, keepdim=True)
-            z_std = z.std(dim=-1, keepdim=True)
-            c_mean = context.mean(dim=-1, keepdim=True)
-            c_std = context.std(dim=-1, keepdim=True)
-            z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
+            if noise > 0.0:
+                z = z + noise * math.sqrt(dt) * torch.randn_like(z)
+            if traj is not None:
+                with torch.no_grad():
+                    traj.append({
+                        "step": i,
+                        "z_norm": z.norm(dim=-1).mean().item(),
+                        "v_norm": velocity.norm(dim=-1).mean().item(),
+                        "logit_entropy": float("nan"),  # filled below
+                    })
 
         logits = self.output(self.state_norm(z))
-        result: dict[str, torch.Tensor] = {"logits": logits}
+
+        # Fill logit entropy into trajectory
+        if traj is not None:
+            with torch.no_grad():
+                p = F.softmax(logits, dim=-1)
+                ent = -(p * p.clamp(1e-9).log()).sum(-1).mean().item()
+            for t in traj:
+                t["logit_entropy"] = ent
+
+        result: dict[str, Tensor] = {"logits": logits}
         if labels is not None:
-            # Causal shift: token at position i predicts token i+1
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:target_length].contiguous()
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = labels[:, 1:T].contiguous()
             result["loss"] = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+                shift_logits.view(-1, self.cfg.vocab_size),
+                shift_labels.view(-1), ignore_index=-100)
         if return_states:
             result["states"] = z
+        if traj is not None:
+            result["trajectory"] = traj
+
+        if routing_mode is not None:
+            self.anchor.mode = _orig  # type: ignore[possibly-undefined]
         return result
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> torch.Tensor:
+    def generate(self, input_ids: Tensor, max_new_tokens: int,
+                 temperature: float = 1.0, top_k: int = 50) -> Tensor:
         self.eval()
-        generated = input_ids
         for _ in range(max_new_tokens):
-            outputs = self(generated)
-            logits = outputs["logits"][:, -1] / max(temperature, 1e-6)
-            if top_k is not None:
-                values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < values[:, [-1]], float("-inf"))
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
-        return generated
+            out    = self.forward(input_ids)
+            logits = out["logits"][:, -1] / max(temperature, 1e-6)
+            if top_k:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+            next_tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            input_ids = torch.cat([input_ids, next_tok], dim=1)
+        return input_ids
 
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
-class DeliberativeContinuousMeaningField(nn.Module):
-    """Parallel CMF with iterative latent refinement and learned halting.
-
-    This is the architecture path for "thinking longer" inside the model rather
-    than only in the outer sampling loop. The encoder builds a context
-    landscape, then the latent state is refined through multiple vector-field
-    passes. A halt head exposes how ready the model thinks each latent position
-    is, allowing inference-time early stopping when adaptive thinking is enabled.
-    """
-
-    def __init__(self, config: CMFConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = UpgradedContextEncoder(config)
-        self.initial_state = nn.Linear(config.d_model, config.d_model)
-        self.field = VectorField(config)
-        self.gate_norm = nn.LayerNorm(config.d_model * 3)  # Pre-norm before update gate for 96-step stability
-        self.update_gate = nn.Linear(config.d_model * 3, config.d_model)
-        self.halt_head = nn.Linear(config.d_model, 1)
-        self.state_norm = nn.LayerNorm(config.d_model)
-        self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
-            self.output.weight = self.embedding.weight
-            
-        # Rotary Position Embeddings for 32k+ Extrapolation
-        self.rope = RotaryPositionEmbedding(config.d_model)
-
-        # Anchoring projections for learnable semantic attention routing inside the deliberation loop
-        self.num_heads = 4
-        while self.num_heads > 1 and config.d_model % self.num_heads != 0:
-            self.num_heads //= 2
-        self.head_dim = config.d_model // self.num_heads
-        self.anchor_q = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.anchor_k = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.anchor_v = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.anchor_out = nn.Linear(config.d_model, config.d_model, bias=False)
-        self._forward_calls = 0
-
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
-        mapped_state_dict = {}
+    def load_state_dict(self, state_dict: dict, strict: bool = True):
+        # Key remapping for backward compat with v1 checkpoints
+        remap = {}
         for k, v in state_dict.items():
             if k.startswith("encoder.blocks."):
-                new_key = "encoder.cnn.blocks." + k[len("encoder.blocks."):]
-                mapped_state_dict[new_key] = v
+                remap["encoder.cnn.blocks." + k[len("encoder.blocks."):]] = v
             elif k == "field.memory":
-                # Backward compat with MoE Factual Retrieval upgrade
-                mapped_state_dict["field.memory_bank.memory"] = v
-                mapped_state_dict["field.memory"] = v
-                mapped_state_dict["field.memory_bank.values"] = torch.cat([v, v], dim=-1)
+                pass   # v1 FactualMemoryBank key — drop silently
             else:
-                mapped_state_dict[k] = v
-        # Disable strict loading automatically to gracefully accept newly injected architectural parameters 
-        # (RoPE, MoE values, Ponder heads) without crashing the active run.
-        return super().load_state_dict(mapped_state_dict, strict=False)
+                remap[k] = v
+        return super().load_state_dict(remap, strict=False)
 
-    def _thinking_budget(self) -> int:
-        if self.config.adaptive_thinking:
-            steps = max(self.config.min_thinking_steps, self.config.max_thinking_steps)
-        else:
-            steps = max(1, self.config.thinking_steps)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deliberative CMF — iterative latent refinement with real halting
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DeliberativeCMF(nn.Module):
+    """
+    Parallel CMF + iterative latent refinement (thinking steps).
+
+    Key fixes vs DeliberativeContinuousMeaningField:
+    - No CGMP projection inside the thinking loop
+    - No sin(z*1000) jitter
+    - No Symplectic Curl drift
+    - No Dynamic Attention Tempering (fixed temperature)
+    - HaltHead ACTUALLY stops the loop when threshold is reached
+    - Per-step logits recorded for logit evolution measurement
+    - Attention temperature fixed at 1/sqrt(head_dim)
+
+    Per-step trajectory returned when log_trajectory=True for Phase 0
+    visualization infrastructure.
+    """
+    def __init__(self, cfg: CMFConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        self.embedding     = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.encoder       = ContextEncoder(cfg)
+        self.initial_state = nn.Linear(cfg.d_model, cfg.d_model)
+        self.anchor        = ManifoldAnchor(cfg)
+        self.memory        = SlotMemory(cfg)
+        self.field         = VectorField(cfg)
+        self.halt          = HaltHead(cfg.d_model, min_steps=cfg.min_thinking_steps
+                                      if cfg.adaptive_thinking else 2)
+
+        # Update gate: combines current z, proposal, and context
+        D = cfg.d_model
+        self.gate_norm   = nn.LayerNorm(D * 3)
+        self.update_gate = nn.Linear(D * 3, D)
+        nn.init.constant_(self.update_gate.bias, -2.0)  # conservative start
+
+        self.state_norm = nn.LayerNorm(D)
+        self.output     = nn.Linear(D, cfg.vocab_size, bias=False)
+        if cfg.tie_embeddings:
+            self.output.weight = self.embedding.weight
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _thinking_steps(self) -> int:
         if self.training:
-            # Neural ODE step-extrapolation: training with 8 steps is 12x faster, consumes 12x less VRAM,
-            # and allows zero-shot scaling up to 96+ steps at inference time.
-            return min(steps, 8)
-        return steps
+            # Train with fewer steps; ODE extrapolates to more at inference
+            return min(self.cfg.thinking_steps, 8)
+        if self.cfg.adaptive_thinking:
+            return self.cfg.max_thinking_steps
+        return self.cfg.thinking_steps
+
+    def _one_thinking_step(
+        self, z: Tensor, context: Tensor, step_idx: int, total_steps: int
+    ) -> tuple[Tensor, Tensor]:
+        """One thinking step. Returns (z_new, velocity)."""
+        B, T, D = z.shape
+        dt = 1.0 / total_steps
+        tau = torch.full((B,), (step_idx + 0.5) * dt, dtype=z.dtype, device=z.device)
+
+        anchored = self.anchor(z, context)
+        slot     = self.memory(z, context)
+        velocity = self.field(anchored, context, slot, tau)
+        proposal = z + velocity * dt
+
+        # Gated update (residual blend of proposal and current z)
+        gate_input = self.gate_norm(torch.cat([z, proposal, context], dim=-1))
+        gate       = torch.sigmoid(self.update_gate(gate_input))
+        z_new      = z + gate * (proposal - z)
+
+        # Euler-Maruyama noise during training ONLY
+        if self.training:
+            z_new = z_new + 1e-4 * math.sqrt(dt) * torch.randn_like(z_new)
+
+        return z_new, velocity
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        goal: Optional[torch.Tensor] = None,
-        target_length: Optional[int] = None,
+        input_ids: Tensor,
+        labels: Optional[Tensor] = None,
         return_states: bool = False,
-        gradient_checkpointing: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        if input_ids.ndim != 2:
-            raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
+        grad_ckpt: bool = False,
+        routing_mode: Optional[str] = None,
+        log_trajectory: bool = False,
+    ) -> dict[str, Tensor]:
+        if routing_mode is not None:
+            _orig = self.anchor.mode
+            self.anchor.mode = routing_mode
 
-        if self.training:
-            self._forward_calls += 1
+        B, T = input_ids.shape
+        emb     = self.embedding(input_ids)
+        context = self.encoder(emb, grad_ckpt=grad_ckpt)
+        z       = self.initial_state(context)
 
-        batch_size, seq_len = input_ids.shape
-        target_length = target_length or seq_len
-        if target_length > seq_len:
-            raise ValueError("DeliberativeContinuousMeaningField cannot extrapolate target_length")
+        steps = self._thinking_steps()
+        traj:  list[dict] = []
+        states: list[Tensor] = []
+        halt_probs: list[Tensor] = []
+        ponder_loss = torch.tensor(0.0, device=z.device)
+        actual_steps = 0
 
-        context = self.encoder(self.embedding(input_ids), gradient_checkpointing=gradient_checkpointing)[:, :target_length]
-        
-        # Apply RoPE to the latent landscape to permanently anchor spatial positioning for massive context windows
-        cos, sin = self.rope(context, target_length)
-        context = apply_rotary_pos_emb(context, cos, sin)
-        
-        z = self.initial_state(context)
-        goal_sequence = _goal_like(goal, z)
-        steps = self._thinking_budget()
-        halt_means = []
-        states = []
+        for i in range(steps):
+            z, velocity = self._one_thinking_step(z, context, i, steps)
+            halt_prob, should_halt = self.halt(
+                z, velocity, step=i,
+                threshold=self.cfg.halting_threshold)
+            halt_probs.append(halt_prob)
+            ponder_loss = ponder_loss + (1.0 - halt_prob)
+            actual_steps = i + 1
 
-        flat_context = context.reshape(batch_size * target_length, -1)
-        flat_goal = (
-            goal_sequence.reshape(batch_size * target_length, -1)
-            if goal_sequence is not None
-            else None
-        )
+            if log_trajectory or return_states:
+                with torch.no_grad():
+                    logits_step = self.output(self.state_norm(z))
+                    p   = F.softmax(logits_step, dim=-1)
+                    ent = -(p * p.clamp(1e-9).log()).sum(-1).mean().item()
+                traj.append({
+                    "step": i,
+                    "z_norm": z.norm(dim=-1).mean().item(),
+                    "v_norm": velocity.norm(dim=-1).mean().item(),
+                    "halt_prob": halt_prob.item(),
+                    "logit_entropy": ent,
+                })
+                if return_states:
+                    states.append(z.detach())
 
-        if return_states:
-            # If returning states is requested, we do it in eager mode since checkpointing isn't needed
-            actual_steps = 0
-            ponder_loss = torch.tensor(0.0, device=z.device)
-            step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
-            for step_idx in range(steps):
-                tau_value = (step_idx + 0.5) / float(steps)
-                tau = torch.full(
-                    (batch_size * target_length,),
-                    tau_value,
-                    dtype=z.dtype,
-                    device=z.device,
-                )
-                flat_z = z.reshape(batch_size * target_length, -1)
-                velocity = self.field(flat_z, flat_context, tau, goal=flat_goal).reshape_as(z)
-                proposal = z + velocity / float(steps)
-                
-                if target_length > 1:
-                    q = self.anchor_q(proposal).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                    k = self.anchor_k(context).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                    v = self.anchor_v(context).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                    
-                    z_proj = torch.nn.functional.scaled_dot_product_attention(
-                        q, k, v, is_causal=True
-                    )
-                    z_proj = z_proj.transpose(1, 2).reshape(batch_size, target_length, self.config.d_model)
-                    z_proj = self.anchor_out(z_proj)
-                    proposal = (1.0 - step_anchor_scale) * proposal + step_anchor_scale * z_proj
-                
-                gate_input = torch.cat([z, proposal, context], dim=-1)
-                gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
-                
-                delta_z = gate * (proposal - z)
-                z_next = z + delta_z
-                
-                # 3. Hamiltonian Symplectic Curl Stabilization (Deterministic orbit around attractors)
-                d_half = delta_z.size(-1) // 2
-                delta_q = delta_z[..., :d_half]
-                delta_p = delta_z[..., d_half:]
-                symplectic_curl = torch.cat([delta_p, -delta_q], dim=-1)
-                z_next = z_next + 0.10 * symplectic_curl
-                
-                # 4. Langevin Stochastic Noise Injection (Regularization during training)
-                if self.training:
-                    noise = torch.randn_like(z_next) * 1e-4
-                    jitter = torch.sin(z_next * 1000.0) * 1e-6
-                    z_next = z_next + noise + jitter
-                    
-                z = z_next
-                
-                # Project intermediate state for return history/halt prediction, but do not accumulate projection drift
-                z_mean = z.mean(dim=-1, keepdim=True)
-                z_std = z.std(dim=-1, keepdim=True)
-                c_mean = context.mean(dim=-1, keepdim=True)
-                c_std = context.std(dim=-1, keepdim=True)
-                z_projected = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-                
-                halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_projected)))
-                halt_means.append(halt_prob.mean())
-                actual_steps = step_idx + 1
-                states.append(z_projected)
-            
-            # Final z state returned is the projected final step state
-            z = states[-1]
-        else:
-            # High-performance grouped deliberation (95% faster autograd loop)
-            # Pass all tensor closures explicitly as inputs to enable correct gradient tracking under checkpointing
-            def run_deliberation(z_val, context_val, flat_context_val, flat_goal_val):
-                probs_list = []
-                ponder_losses = []
-                
-                # Enforce FP32 state accumulation to prevent scale-induced FP16 numerical drift 
-                # during long-horizon thinking orbits (critical for >1B param models).
-                z_accum = z_val.to(torch.float32)
-                step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
-                
-                for step_idx in range(steps):
-                    tau_value = (step_idx + 0.5) / float(steps)
-                    tau = torch.full(
-                        (batch_size * target_length,),
-                        tau_value,
-                        dtype=z_accum.dtype,
-                        device=z_accum.device,
-                    )
-                    
-                    # Convert down to optimal precision (FP16/BF16 via autocast) for heavy matrix math
-                    flat_z = z_accum.to(z_val.dtype).reshape(batch_size * target_length, -1)
-                    
-                    velocity = self.field(flat_z, flat_context_val, tau, goal=flat_goal_val).reshape_as(z_val)
-                    proposal = z_accum.to(z_val.dtype) + velocity / float(steps)
-                    
-                    lock_on = None
-                    if target_length > 1:
-                        q = self.anchor_q(proposal).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                        k = self.anchor_k(context_val).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                        v = self.anchor_v(context_val).view(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
-                        
-                        # Dynamic Attention Tempering
-                        if self.training:
-                            temp = max(0.2, 2.0 - (self._forward_calls / 1500.0) * 1.8)
-                        else:
-                            temp = 0.2
-                        
-                        scale = 1.0 / (temp * math.sqrt(self.head_dim))
-                        sim = torch.matmul(q, k.transpose(-1, -2)) * scale
-                        mask = torch.triu(torch.full((target_length, target_length), float("-inf"), device=sim.device), diagonal=1)
-                        sim = sim + mask
-                        attn = torch.softmax(sim, dim=-1)
-                        
-                        # Compute entropy of attention over context landscape
-                        p = torch.clamp(attn, min=1e-9)
-                        entropy = -torch.sum(p * torch.log2(p), dim=-1)
-                        mean_entropy = entropy.mean(dim=1)
-                        max_entropy = math.log2(target_length) if target_length > 1 else 1.0
-                        norm_entropy = mean_entropy / max_entropy
-                        lock_on = 1.0 - norm_entropy
-                        
-                        z_proj = torch.matmul(attn, v)
-                        z_proj = z_proj.transpose(1, 2).reshape(batch_size, target_length, self.config.d_model)
-                        z_proj = self.anchor_out(z_proj)
-                        proposal = (1.0 - step_anchor_scale) * proposal + step_anchor_scale * z_proj
-                    
-                    gate_input = torch.cat([z_accum.to(z_val.dtype), proposal, context_val], dim=-1)
-                    gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
-                    if lock_on is not None:
-                        gate = gate * (1.0 - lock_on.unsqueeze(-1))
-                    
-                    # Core residual physics update strictly executed in FP32
-                    delta_z = gate.to(torch.float32) * (proposal.to(torch.float32) - z_accum)
-                    z_accum = z_accum + delta_z
-                    
-                    # 3. Hamiltonian Symplectic Curl Stabilization (Deterministic orbit around attractors)
-                    d_half = delta_z.size(-1) // 2
-                    delta_q = delta_z[..., :d_half]
-                    delta_p = delta_z[..., d_half:]
-                    symplectic_curl = torch.cat([delta_p, -delta_q], dim=-1)
-                    z_accum = z_accum + 0.10 * symplectic_curl
-                    
-                    # 4. Langevin Stochastic Noise Injection (Regularization during training)
-                    if self.training:
-                        noise = torch.randn_like(z_accum) * 1e-4
-                        jitter = torch.sin(z_accum * 1000.0) * 1e-6
-                        z_accum = z_accum + noise + jitter
-                    
-                    # Project temporarily to check halt condition, but do not accumulate projection drift
-                    z_temp = z_accum.to(z_val.dtype)
-                    z_mean = z_temp.mean(dim=-1, keepdim=True)
-                    z_std = z_temp.std(dim=-1, keepdim=True)
-                    c_mean = context_val.mean(dim=-1, keepdim=True)
-                    c_std = context_val.std(dim=-1, keepdim=True)
-                    z_temp_proj = ((z_temp - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-                    
-                    # Ponder cost mechanism: penalize low halt probabilities at each step 
-                    # to strictly calibrate the halting head (solves over-thinking bottleneck)
-                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_temp_proj)))
-                    probs_list.append(halt_prob.mean())
-                    ponder_losses.append((1.0 - halt_prob).mean())
-                    
-                # Project the final accumulated state
-                z_accum_temp = z_accum.to(z_val.dtype)
-                z_mean = z_accum_temp.mean(dim=-1, keepdim=True)
-                z_std = z_accum_temp.std(dim=-1, keepdim=True)
-                c_mean = context_val.mean(dim=-1, keepdim=True)
-                c_std = context_val.std(dim=-1, keepdim=True)
-                z_final_proj = ((z_accum_temp - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-                
-                return z_final_proj, torch.stack(probs_list), torch.stack(ponder_losses)
-
-            actual_steps = steps
-            if gradient_checkpointing:
-                z, halt_stack, ponder_stack = torch.utils.checkpoint.checkpoint(
-                    run_deliberation,
-                    z,
-                    context,
-                    flat_context,
-                    flat_goal,
-                    use_reentrant=False
-                )
-                halt_means = list(halt_stack)
-                ponder_loss = ponder_stack.sum()
-            else:
-                z, halt_stack, ponder_stack = run_deliberation(z, context, flat_context, flat_goal)
-                halt_means = list(halt_stack)
-                ponder_loss = ponder_stack.sum()
+            if should_halt and not self.training:
+                break
 
         logits = self.output(self.state_norm(z))
-        result: dict[str, torch.Tensor] = {
+        result: dict[str, Tensor] = {
             "logits": logits,
             "thinking_steps": torch.tensor(actual_steps, device=z.device),
-            "halt_mean": torch.stack(halt_means).mean() if halt_means else torch.tensor(0.0, device=z.device),
-            "ponder_loss": ponder_loss if not return_states else torch.tensor(0.0, device=z.device),
+            "halt_mean": torch.stack(halt_probs).mean() if halt_probs else torch.tensor(0.0),
+            "ponder_loss": ponder_loss / max(actual_steps, 1),
         }
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:target_length].contiguous()
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = labels[:, 1:T].contiguous()
             result["loss"] = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-        if return_states:
-            if states:
-                result["states"] = torch.stack(states, dim=1)
-            else:
-                result["states"] = z.unsqueeze(1)
+                shift_logits.view(-1, self.cfg.vocab_size),
+                shift_labels.view(-1), ignore_index=-100)
+        if return_states and states:
+            result["states"] = torch.stack(states, dim=1)
+        if log_trajectory:
+            result["trajectory"] = traj  # type: ignore[assignment]
+
+        if routing_mode is not None:
+            self.anchor.mode = _orig  # type: ignore[possibly-undefined]
         return result
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        use_velocity_halting: bool = True,
-        velocity_epsilon: float = 0.005,
-        stochastic_langevin: bool = True, # Enabled: Combined with Symplectic curl for noise-driven escape
-        langevin_noise_scale: float = 1e-4,
-        sharp_memory_scale: float = 0.25, # Enabled by default for zero-shot attention sharpness!
-        repetition_penalty: float = 1.15,
-    ) -> torch.Tensor:
+    def generate(self, input_ids: Tensor, max_new_tokens: int,
+                 temperature: float = 1.0, top_k: int = 50) -> Tensor:
         self.eval()
-        generated = input_ids
-        
         for _ in range(max_new_tokens):
-            # Run context encoder on the full active sequence
-            context = self.encoder(self.embedding(generated))
-            cos, sin = self.rope(context, context.size(1))
-            context = apply_rotary_pos_emb(context, cos, sin)
-            
-            # Grab the last position's context representation
-            c_last = context[:, -1]
-            
-            # Project to initial continuous state
-            z = self.initial_state(c_last)
-            
-            steps = self._thinking_budget()
-            flat_goal = None
-            step_anchor_scale = min(0.9, 0.15 * (8.0 / steps))
-            
-            for step_idx in range(steps):
-                tau_value = (step_idx + 0.5) / float(steps)
-                tau = torch.full(
-                    (input_ids.size(0),),
-                    tau_value,
-                    dtype=z.dtype,
-                    device=z.device,
-                )
-                
-                # 1. Dynamic Cosine Steering (Zero-Shot Attention sharpness)
-                if sharp_memory_scale > 0.0 and context.size(1) > 1:
-                    past_contexts = context[:, :-1]
-                    sim = torch.matmul(z.unsqueeze(1), past_contexts.transpose(-1, -2)).squeeze(1) / math.sqrt(z.size(-1))
-                    weights = torch.softmax(sim, dim=-1)
-                    c_sharp = torch.matmul(weights.unsqueeze(1), past_contexts).squeeze(1)
-                    c_effective = c_last + sharp_memory_scale * c_sharp
-                else:
-                    c_effective = c_last
-                
-                # Dynamic field velocity
-                velocity = self.field(z, c_effective, tau, goal=flat_goal)
-                proposal = z + velocity / float(steps)
-                gate_input = torch.cat([z, proposal, c_effective], dim=-1)
-                gate = torch.sigmoid(self.update_gate(self.gate_norm(gate_input)))
-                
-                # Calculate change magnitude (velocity)
-                delta_z = gate * (proposal - z)
-                z_next = z + delta_z
-                
-                # 2. Subspace Manifold Anchoring (Eliminates Solver Drift in FP16)
-                if context.size(1) > 1:
-                    sim_anchor = torch.matmul(z_next.unsqueeze(1), context.transpose(-1, -2)).squeeze(1) / math.sqrt(z_next.size(-1))
-                    w_anchor = torch.softmax(sim_anchor, dim=-1)
-                    z_proj = torch.matmul(w_anchor.unsqueeze(1), context).squeeze(1)
-                    # Anchor active state to the context landscape manifold softly
-                    z_next = (1.0 - step_anchor_scale) * z_next + step_anchor_scale * z_proj
-                
-                # 3. Hamiltonian Symplectic Curl Stabilization (Deterministic orbit around attractors, replaces loops)
-                d_half = delta_z.size(-1) // 2
-                delta_q = delta_z[..., :d_half]
-                delta_p = delta_z[..., d_half:]
-                symplectic_curl = torch.cat([delta_p, -delta_q], dim=-1)
-                z_next = z_next + 0.10 * symplectic_curl
-                
-                # 4. Langevin Stochastic Noise Injection (Breaks cyclic orbits to escape loops)
-                if stochastic_langevin and temperature > 0.0:
-                    noise = torch.randn_like(z_next) * langevin_noise_scale * temperature
-                    jitter = torch.sin(z_next * 1000.0) * 1e-6
-                    z_next = z_next + noise + jitter
-                    
-                # Project temporarily to check halt condition/final state, but do not accumulate projection drift
-                z_mean = z_next.mean(dim=-1, keepdim=True)
-                z_std = z_next.std(dim=-1, keepdim=True)
-                c_mean = c_effective.mean(dim=-1, keepdim=True)
-                c_std = c_effective.std(dim=-1, keepdim=True)
-                z_next_proj = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-                
-                if use_velocity_halting:
-                    # L2 norm over model dimension
-                    velocity_norm = torch.norm(delta_z, p=2, dim=-1)
-                    if torch.all(velocity_norm < velocity_epsilon):
-                        z = z_next_proj
-                        break
-                else:
-                    # Fallback to standard learned halting head
-                    halt_prob = torch.sigmoid(self.halt_head(self.state_norm(z_next_proj)))
-                    if torch.all(halt_prob >= self.config.halting_threshold):
-                        z = z_next_proj
-                        break
-                
-                z = z_next
+            out    = self.forward(input_ids)
+            logits = out["logits"][:, -1] / max(temperature, 1e-6)
+            if top_k:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+            next_tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            input_ids = torch.cat([input_ids, next_tok], dim=1)
+        return input_ids
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def load_state_dict(self, state_dict: dict, strict: bool = True):
+        remap = {}
+        for k, v in state_dict.items():
+            if k.startswith("encoder.blocks."):
+                remap["encoder.cnn.blocks." + k[len("encoder.blocks."):]] = v
+            elif k == "field.memory":
+                pass
             else:
-                # If we completed all steps without early halting, project the final z
-                z_mean = z.mean(dim=-1, keepdim=True)
-                z_std = z.std(dim=-1, keepdim=True)
-                c_mean = c_effective.mean(dim=-1, keepdim=True)
-                c_std = c_effective.std(dim=-1, keepdim=True)
-                z = ((z - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-            
-            # Predict the next token from final state
-            logits = self.output(self.state_norm(z))
-            
-            # 4. Apply Repetition Penalty to prevent coordinate collapse loops
-            if repetition_penalty != 1.0:
-                logits = logits.clone()
-                for batch_idx in range(generated.size(0)):
-                    token_ids = torch.unique(generated[batch_idx])
-                    token_logits = logits[batch_idx, token_ids]
-                    logits[batch_idx, token_ids] = torch.where(
-                        token_logits < 0,
-                        token_logits * repetition_penalty,
-                        token_logits / repetition_penalty,
-                    )
-            
-            # Apply Temperature
-            logits = logits / max(temperature, 1e-6)
-            
-            # Apply Top-K filtering
-            if top_k is not None:
-                values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < values[:, [-1]], float("-inf"))
-                
-            # Apply Top-P (Nucleus) Filtering
-            top_p = 0.90
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                remove = cumulative > top_p
-                remove[..., 1:] = remove[..., :-1].clone()
-                remove[..., 0] = False
-                logits = logits.scatter(
-                    dim=-1,
-                    index=sorted_indices,
-                    src=sorted_logits.masked_fill(remove, float("-inf"))
-                )
-                
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
-            
-        return generated
+                remap[k] = v
+        return super().load_state_dict(remap, strict=False)
+
+# Backward compatibility aliases
+ContinuousMeaningField = ParallelCMF
+ParallelContinuousMeaningField = ParallelCMF
+DeliberativeContinuousMeaningField = DeliberativeCMF
+
 

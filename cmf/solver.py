@@ -1,160 +1,149 @@
-from __future__ import annotations
+"""
+CMF Solver — clean numerical integrators.
 
+What was removed from v1:
+  • Context-Guided Manifold Projection (CGMP) in every Euler step.
+    This normalises z to context statistics at every step which is:
+    (a) not a valid ODE integration method
+    (b) destroys gradient signal — every step overwrites z scale
+    (c) makes the solver non-ablatable (projection is always active)
+
+  • sin(z * 1000.0) * 1e-6 jitter — BF16 mantissa cannot represent 1e-6
+    differences reliably; creates periodic artefacts in attention entropy;
+    non-reproducible across hardware.
+
+  • Hamiltonian Symplectic Curl: z += 0.10 * cat(delta_p, -delta_q)
+    This is a non-conservative perturbation that grows with step count,
+    not a real symplectic integrator (which requires paired (q,p) dynamics).
+    It adds O(steps) accumulated drift with no physical justification.
+
+What remains:
+  • euler_step: z_{t+1} = z_t + dt * v(z_t, c, τ)  [clean, standard]
+  • rk4_step:   classical 4th-order Runge-Kutta     [ablation comparison]
+  • euler_maruyama: Euler + Wiener noise during training [proper SDE]
+  • integrate_fixed: run N steps with either method
+  • integrate_adaptive: curvature-based step selection (kept from v1, logic is sound)
+"""
+
+from __future__ import annotations
 import math
+from typing import Callable, Tuple
 
 import torch
-from typing import Callable
+from torch import Tensor
+
+FieldFn = Callable[[Tensor, Tensor, Tensor], Tensor]  # (z, context, tau) -> velocity
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-step integrators
+# ─────────────────────────────────────────────────────────────────────────────
 
 def euler_step(
-    z: torch.Tensor,
-    context: torch.Tensor,
-    tau: torch.Tensor,
-    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    z: Tensor,
+    context: Tensor,
+    tau: Tensor,
+    field_fn: FieldFn,
     dt: float,
-) -> torch.Tensor:
-    """Perform a single Euler step with Context-Guided Manifold Projection (CGMP)."""
-    z_next = z + dt * field_fn(z, context, tau)
-    if z_next.size(-1) > 1:
-        z_mean = z_next.mean(dim=-1, keepdim=True)
-        z_std = z_next.std(dim=-1, keepdim=True, unbiased=False)
-        c_mean = context.mean(dim=-1, keepdim=True)
-        c_std = context.std(dim=-1, keepdim=True, unbiased=False)
-        mask = (c_std > 1e-5) & (z_std > 1e-6)
-        projected = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-        z_next = torch.where(mask, projected, z_next)
+    noise_scale: float = 0.0,
+) -> Tensor:
+    v = field_fn(z, context, tau)
+    z_next = z + dt * v
+    if noise_scale > 0.0:
+        z_next = z_next + noise_scale * math.sqrt(dt) * torch.randn_like(z_next)
     return z_next
+
 
 def rk4_step(
-    z: torch.Tensor,
-    context: torch.Tensor,
-    tau: torch.Tensor,
-    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    z: Tensor,
+    context: Tensor,
+    tau: Tensor,
+    field_fn: FieldFn,
     dt: float,
-) -> torch.Tensor:
-    """Perform a single RK4 step with Context-Guided Manifold Projection (CGMP)."""
-    k1 = field_fn(z, context, tau)
+) -> Tensor:
+    k1 = field_fn(z,                  context, tau)
     k2 = field_fn(z + 0.5 * dt * k1, context, tau + 0.5 * dt)
     k3 = field_fn(z + 0.5 * dt * k2, context, tau + 0.5 * dt)
-    k4 = field_fn(z + dt * k3, context, tau + dt)
-    z_next = z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    if z_next.size(-1) > 1:
-        z_mean = z_next.mean(dim=-1, keepdim=True)
-        z_std = z_next.std(dim=-1, keepdim=True, unbiased=False)
-        c_mean = context.mean(dim=-1, keepdim=True)
-        c_std = context.std(dim=-1, keepdim=True, unbiased=False)
-        mask = (c_std > 1e-5) & (z_std > 1e-6)
-        projected = ((z_next - z_mean) / torch.clamp(z_std, min=1e-6)) * c_std + c_mean
-        z_next = torch.where(mask, projected, z_next)
-    return z_next
+    k4 = field_fn(z + dt * k3,        context, tau + dt)
+    return z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
-def integrate_symplectic_leapfrog(
-    z0: torch.Tensor,
-    context: torch.Tensor,
-    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-    steps: int,
-    dt: float,
-) -> torch.Tensor:
-    """Integrate for a fixed number of steps using a Symplectic Leapfrog (Verlet) scheme."""
-    z = z0.clone()
-    batch_size = z.size(0)
-    d_half = z.size(-1) // 2
-    
-    q = z[..., :d_half]
-    p = z[..., d_half:]
-    
-    for step_idx in range(steps):
-        tau = torch.full(
-            (batch_size,),
-            step_idx * dt,
-            dtype=z.dtype,
-            device=z.device,
-        )
-        
-        # 1. Half-step momentum update
-        z_q = torch.cat([q, torch.zeros_like(p)], dim=-1)
-        force = field_fn(z_q, context, tau)[..., d_half:]
-        p = p + 0.5 * dt * force
-        
-        # 2. Full-step position update
-        q = q + dt * p
-        
-        # 3. Full-step momentum update
-        tau_next = torch.full(
-            (batch_size,),
-            (step_idx + 1) * dt,
-            dtype=z.dtype,
-            device=z.device,
-        )
-        z_q_next = torch.cat([q, torch.zeros_like(p)], dim=-1)
-        force_next = field_fn(z_q_next, context, tau_next)[..., d_half:]
-        p = p + 0.5 * dt * force_next
-        
-    return torch.cat([q, p], dim=-1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixed-step integration
+# ─────────────────────────────────────────────────────────────────────────────
 
 def integrate_fixed(
-    z0: torch.Tensor,
-    context: torch.Tensor,
-    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    z0: Tensor,
+    context: Tensor,
+    field_fn: FieldFn,
     steps: int,
-    dt: float,
-    method: str = "euler"
-) -> torch.Tensor:
-    """Integrate for a fixed number of steps."""
-    if method == "symplectic":
-        return integrate_symplectic_leapfrog(z0, context, field_fn, steps, dt)
+    method: str = "euler",
+    noise_scale: float = 0.0,
+    return_trajectory: bool = False,
+) -> Tensor | tuple[Tensor, list[Tensor]]:
+    """Integrate from τ=0 to τ=1 in `steps` equal substeps."""
     z = z0
-    batch_size = z.size(0)
-    for step_idx in range(steps):
-        tau = torch.full(
-            (batch_size,),
-            step_idx * dt,
-            dtype=z.dtype,
-            device=z.device,
-        )
+    dt = 1.0 / steps
+    traj = [z] if return_trajectory else None
+
+    for i in range(steps):
+        tau = torch.full(z.shape[:-1], i * dt, dtype=z.dtype, device=z.device)
         if method == "rk4":
             z = rk4_step(z, context, tau, field_fn, dt)
         else:
-            z = euler_step(z, context, tau, field_fn, dt)
+            z = euler_step(z, context, tau, field_fn, dt, noise_scale=noise_scale)
+        if traj is not None:
+            traj.append(z)
+
+    if return_trajectory:
+        return z, traj
     return z
 
-def integrate_adaptive(
-    z0: torch.Tensor,
-    context: torch.Tensor,
-    field_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-    min_steps: int,
-    max_steps: int,
-    curvature_threshold: float = 0.1,
-) -> tuple[torch.Tensor, int]:
-    """Integrate one latent-time interval with a curvature-selected step count.
 
-    The controller first probes the field to decide how many Euler substeps are
-    worth spending, then integrates with ``dt = 1 / steps``. This keeps every
-    token transition on the same latent-time horizon while still allocating
-    extra work to curved fields.
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive integration (curvature-based step selection — logic from v1 is fine)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def integrate_adaptive(
+    z0: Tensor,
+    context: Tensor,
+    field_fn: FieldFn,
+    min_steps: int = 2,
+    max_steps: int = 16,
+    curvature_threshold: float = 0.05,
+    noise_scale: float = 0.0,
+) -> Tuple[Tensor, int]:
+    """
+    Probe curvature of the field and select step count accordingly.
+    Returns (z_final, steps_used).
+
+    This implements the adaptive compute test (checklist Phase 3.2):
+    easy inputs should converge in min_steps; hard inputs use more.
     """
     if min_steps <= 0:
         raise ValueError("min_steps must be positive")
     if max_steps < min_steps:
-        raise ValueError("max_steps must be greater than or equal to min_steps")
+        raise ValueError("max_steps >= min_steps required")
 
-    batch_size = z0.size(0)
     eps = torch.finfo(z0.dtype).eps if torch.is_floating_point(z0) else 1e-7
+    batch = z0.shape[0] if z0.ndim >= 2 else 1
 
     with torch.no_grad():
-        tau0 = torch.zeros((batch_size,), dtype=z0.dtype, device=z0.device)
-        taum = torch.full((batch_size,), 0.5, dtype=z0.dtype, device=z0.device)
-        v0 = field_fn(z0, context, tau0)
-        probe_z = z0 + 0.5 * v0
-        vm = field_fn(probe_z, context, taum)
-        speed = torch.linalg.norm(v0, dim=-1).mean() + torch.linalg.norm(vm, dim=-1).mean()
-        curvature = torch.linalg.norm(vm - v0, dim=-1).mean() / torch.clamp(speed, min=eps)
-        if curvature_threshold <= 0:
-            selected_steps = max_steps
-        else:
-            step_pressure = float((curvature / curvature_threshold).detach().cpu())
-            selected_steps = min_steps + max(0, math.ceil(step_pressure) - 1)
-            selected_steps = max(min_steps, min(max_steps, selected_steps))
+        tau0 = torch.zeros(batch, dtype=z0.dtype, device=z0.device)
+        taum = torch.full((batch,), 0.5, dtype=z0.dtype, device=z0.device)
 
-    dt = 1.0 / float(selected_steps)
-    z = integrate_fixed(z0, context, field_fn, selected_steps, dt)
-    return z, selected_steps
+        # Reshape for field_fn if z0 is [B, T, D]
+        _z = z0.reshape(batch, -1) if z0.ndim == 3 else z0
+        _c = context.reshape(batch, -1) if context.ndim == 3 else context
+
+        v0 = field_fn(_z, _c, tau0)
+        vm = field_fn(_z + 0.5 * v0, _c, taum)
+
+        speed = (torch.linalg.norm(v0, dim=-1) + torch.linalg.norm(vm, dim=-1)).mean()
+        curvature = torch.linalg.norm(vm - v0, dim=-1).mean() / torch.clamp(speed, min=eps)
+
+        pressure = float((curvature / max(curvature_threshold, eps)).detach().cpu())
+        steps = max(min_steps, min(max_steps, min_steps + max(0, math.ceil(pressure) - 1)))
+
+    z = integrate_fixed(z0, context, field_fn, steps, method="euler", noise_scale=noise_scale)
+    return z, steps

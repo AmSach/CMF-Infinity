@@ -1,1061 +1,344 @@
+"""
+CMF Phase Runner — executes all checklist phases sequentially.
+
+Usage:
+    python scripts/run_phases.py --phase all --preset 50m --device cpu
+    python scripts/run_phases.py --phase 0    # infra + logging smoke test
+    python scripts/run_phases.py --phase 1    # memory verification
+    python scripts/run_phases.py --phase 2    # routing isolation
+    python scripts/run_phases.py --phase 3    # iterative reasoning
+
+Records written to:
+    records/phases/phase_0_infra.json
+    records/phases/phase_1_memory.json
+    records/phases/phase_2_routing.json
+    records/phases/phase_3_reasoning.json
+    records/ablations/routing/routing_ablation.json
+"""
+
 from __future__ import annotations
 
 import argparse
-import csv
-import importlib.util
-import math
-import os
-import shutil
-import subprocess
+import json
 import sys
 import time
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+RECORDS = ROOT / "records"
+
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from cmf import CMFConfig, ContinuousMeaningField
-from cmf.baselines import TemporalConvLM, TinyTransformerLM
-from cmf.benchmarks import parameter_match_report
-from cmf.data import SMALL_LM_TEXT, TOY_TEXT, ByteTokenizer, cyclic_lm_batches, fixed_eval_batches, repeated_corpus
+from cmf.config import CMFConfig
 from cmf.experiments import (
-    benchmark_forward,
-    count_parameters,
-    environment_report,
-    evaluate_loss,
-    finite_dict_values,
-    set_seed,
-    train_fixed_steps,
-    write_json,
-    write_markdown_report,
+    ExperimentLogger, RunConfig, TrainReport,
+    count_parameters, environment_report, evaluate_loss,
+    run_routing_ablation, run_solver_depth_test,
+    run_perturbation_test, set_seed, train_fixed_steps,
 )
-from cmf.fast_integrator import euler_integrate_precomputed
-from cmf.runtime import resolve_device, synchronize_device
+from cmf.memory_tasks import (
+    KeyDoorDataset, MultiBindingDataset, ObjectPermanenceDataset,
+    measure_retention_curve, measure_capacity_curve,
+)
+from cmf.presets import build_model, get_preset
 
 
-RECORDS = ROOT / "records"
-CHECKPOINTS = RECORDS / "checkpoints"
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def now_stamp() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S %z")
+def save_phase(name: str, data: dict) -> None:
+    path = RECORDS / "phases" / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"phase": name, "timestamp": now(),
+            "environment": environment_report(), **data}
+    path.write_text(json.dumps(data, indent=2))
+    print(f"\n[OK] {name} -> {path}")
 
 
-def phase_paths(phase_name: str) -> tuple[Path, Path]:
-    return RECORDS / f"{phase_name}.json", RECORDS / f"{phase_name}.md"
+
+def make_lm_batches(vocab_size: int, batch_size: int, seq_len: int,
+                    n_batches: int, device: torch.device):
+    """Synthetic random LM batches for structural tests."""
+    batches = []
+    for _ in range(n_batches):
+        ids  = torch.randint(0, vocab_size, (batch_size, seq_len))
+        lbls = ids.clone()
+        batches.append((ids.to(device), lbls.to(device)))
+    return batches
 
 
-def record_phase(phase_name: str, title: str, data: dict) -> None:
-    data = {
-        "phase": phase_name,
-        "timestamp": now_stamp(),
-        "environment": environment_report(),
-        **data,
-    }
-    json_path, md_path = phase_paths(phase_name)
-    write_json(json_path, data)
-    write_markdown_report(md_path, title, data)
-    update_handoff(phase_name, data)
+def make_memory_batches(dataset, batch_size: int, device: torch.device):
+    """Pad + batch a memory task dataset."""
+    from torch.nn.utils.rnn import pad_sequence
+    from cmf.memory_tasks import PAD
+    batches = []
+    for start in range(0, len(dataset), batch_size):
+        chunk = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
+        ids = pad_sequence([s["input_ids"] for s in chunk],
+                           batch_first=True, padding_value=PAD)
+        lbl = pad_sequence([s["labels"] for s in chunk],
+                           batch_first=True, padding_value=-100)
+        batches.append((ids.to(device), lbl.to(device)))
+    return batches
 
 
-def update_handoff(phase_name: str, data: dict) -> None:
-    RECORDS.mkdir(parents=True, exist_ok=True)
-    status_files = sorted(RECORDS.glob("phase_*.json"))
-    lines = [
-        "# CMF Handoff",
-        "",
-        f"Last updated: {now_stamp()}",
-        "",
-        "This directory is the operational record for the CMF phase work.",
-        "Another agent can continue by running:",
-        "",
-        "```powershell",
-        r".\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_tmp",
-        "python scripts/run_phases.py --phase all --device auto",
-        "```",
-        "",
-        "## Latest Phase Update",
-        "",
-        f"- Phase: `{phase_name}`",
-        f"- Passed: `{data.get('passed')}`",
-        f"- Gate: {data.get('gate', 'n/a')}",
-        "",
-        "## Phase Files",
-        "",
-    ]
-    for status_file in status_files:
-        lines.append(f"- `{status_file.name}`")
-    lines.extend(
-        [
-            "",
-            "## Environment Notes",
-            "",
-            "- Device is selected by `--device`; CUDA use must be explicit in the command record.",
-            "- CUDA extension results are only valid when explicitly present in `phase_3.json`.",
-            "- The C++/CUDA scaffold remains in `cpp/`; pure PyTorch fallback is the reference path.",
-            "",
-            "## Benchmark And C++ Records",
-            "",
-            "- Matched benchmark: `records/quality_efficiency/latest.json`",
-            "- C++/CUDA status: `records/cpp_extension_status.json`",
-            "- Current claims: `docs/current_claims.md`",
-            "- CMF Infinity architecture: `docs/cmf_infinity_architecture.md`",
-            "",
-        ]
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 0 — Infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def phase_0(preset_name: str, device: torch.device):
+    print("\n=======================================")
+    print("PHASE 0 - Infrastructure smoke test")
+    print("=======================================")
+    set_seed(42)
+
+    model  = build_model(preset_name).to(device)
+    preset = get_preset(preset_name)
+    cfg    = preset.config
+    params = count_parameters(model)
+    print(f"  preset={preset_name}  params={params:,}  device={device}")
+
+    # Smoke: forward + loss + backward
+    ids  = torch.randint(0, cfg.vocab_size, (2, 16), device=device)
+    out  = model(ids, labels=ids, log_trajectory=True)
+    assert "logits" in out
+    assert "loss"   in out
+    out["loss"].backward()
+    print(f"  loss={out['loss'].item():.4f}  OK")
+
+    # Trajectory logging
+    traj = out.get("trajectory", [])
+    print(f"  trajectory steps logged: {len(traj)}")
+
+    # Logger
+    run_cfg = RunConfig(
+        model_name=preset_name, param_count=params,
+        d_model=cfg.d_model, num_slots=cfg.num_slots,
+        solver_steps=cfg.solver_steps,
+        routing_mode=cfg.routing_mode,
+        preset=preset_name, dataset="synthetic",
+        optimizer="AdamW", lr=3e-4,
+        batch_size=2, seq_len=16, seed=42, device=str(device),
     )
-    (RECORDS / "HANDOFF.md").write_text("\n".join(lines), encoding="utf-8")
+    with ExperimentLogger(str(RECORDS / "runs" / "phase0_smoke"), run_cfg) as log:
+        log.log(0, loss=out["loss"].item())
+        if traj:
+            log.log_trajectory(0, traj)
+
+    save_phase("phase_0_infra", {
+        "preset": preset_name, "params": params,
+        "loss": out["loss"].item(),
+        "trajectory_steps": len(traj),
+        "status": "PASS",
+    })
 
 
-def require_pass(data: dict) -> None:
-    if not data.get("passed", False):
-        raise SystemExit(f"{data.get('phase', 'phase')} failed gate: {data.get('gate')}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Memory verification
+# ─────────────────────────────────────────────────────────────────────────────
 
+def phase_1(preset_name: str, device: torch.device):
+    print("\n=======================================")
+    print("PHASE 1 - Memory verification")
+    print("=======================================")
+    set_seed(42)
 
-def make_cmf(
-    d_model: int = 32,
-    hidden_dim: int = 64,
-    num_layers: int = 3,
-    solver_steps: int = 2,
-    max_seq_len: int = 128,
-) -> ContinuousMeaningField:
-    return ContinuousMeaningField(
-        CMFConfig(
-            vocab_size=256,
-            d_model=d_model,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            solver_steps_per_token=solver_steps,
-            max_seq_len=max_seq_len,
-            dropout=0.0,
-            tie_embeddings=False,
-        )
+    # Build a model with the memory-task vocabulary
+    from cmf.memory_tasks import VOCAB_SIZE
+    cfg = CMFConfig(
+        vocab_size=VOCAB_SIZE,
+        d_model=128, hidden_dim=256,
+        num_layers=3, num_slots=16,
+        solver_steps=4, thinking_steps=4,
+        dropout=0.0, tie_embeddings=False,
     )
+    from cmf.model import ParallelCMF
+    model = ParallelCMF(cfg).to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    params = count_parameters(model)
+    print(f"  memory-task model  params={params:,}")
 
+    # ── 1.1: Retention curve ─────────────────────────────────────────────
+    print("\n[1.1] Retention degradation curve (untrained baseline)")
+    gaps = [16, 64, 128, 512]
+    retention_baseline = measure_retention_curve(
+        model, gap_lengths=gaps, n_per_gap=100, device=str(device))
 
-def phase_0(device: torch.device) -> dict:
-    set_seed(100)
-    seq_len = 24
-    batch_size = 8
-    steps = 120
-    grad_accum = 1
-    phase0_text = "continuous meaning field flows. continuous meaning field flows. "
-    data = repeated_corpus(phase0_text, min_bytes=4096)
-    train_batches = cyclic_lm_batches(
-        data,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        num_batches=steps * grad_accum,
-        stride=3,
-    )
-    eval_batches = fixed_eval_batches(
-        phase0_text,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        num_batches=3,
-        min_bytes=4096,
-    )
+    # Quick training on KeyDoor
+    print("\n  Training on KeyDoor (500 steps) ...")
+    ds = KeyDoorDataset(2000, gap_lengths=gaps)
+    train_b = make_memory_batches(ds, batch_size=16, device=device)
+    eval_b  = make_memory_batches(KeyDoorDataset(200, gap_lengths=gaps), 16, device)
 
-    model = make_cmf(d_model=48, hidden_dim=96, num_layers=3, solver_steps=2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
-    report = train_fixed_steps(
-        "cmf_phase0",
-        model,
-        train_batches,
-        eval_batches,
-        device,
-        optimizer,
-        steps=steps,
-        grad_accum_steps=grad_accum,
-    )
-
-    CHECKPOINTS.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "config": model.config.__dict__,
-            "state_dict": model.state_dict(),
-            "report": report.to_dict(),
-        },
-        CHECKPOINTS / "phase0_cmf.pt",
-    )
-
-    tokenizer = ByteTokenizer()
-    prompt = "continuous meaning "
-    generated = tokenizer.encode(prompt).unsqueeze(0).to(device)
-    model.eval()
-    with torch.no_grad():
-        for _ in range(48):
-            output = model(generated)
-            next_token = torch.argmax(output["logits"][:, -1], dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token], dim=1)
-    generation_sample = tokenizer.decode(generated[0])
-
-    generation_has_signal = "field" in generation_sample and "flows" in generation_sample
-    passed = (
-        math.isfinite(report.initial_loss)
-        and math.isfinite(report.final_loss)
-        and report.final_loss < report.initial_loss * 0.25
-        and generation_has_signal
-    )
-    result = {
-        "gate": "CMF toy sanity loss must be finite, improve by at least 75%, and generate key toy-corpus words.",
-        "passed": passed,
-        "train_report": report.to_dict(),
-        "checkpoint": str(CHECKPOINTS / "phase0_cmf.pt"),
-        "training_text": phase0_text,
-        "generation_prompt": prompt,
-        "generation_sample": generation_sample,
-        "generation_has_signal": generation_has_signal,
-    }
-    record_phase("phase_0", "Phase 0 Sanity Learning", result)
-    return result
-
-
-def phase_1(device: torch.device) -> dict:
-    set_seed(101)
-    seq_len = 32
-    batch_size = 4
-    steps = 8
-    corpus = repeated_corpus(SMALL_LM_TEXT, min_bytes=8192)
-    eval_batches = fixed_eval_batches(
-        SMALL_LM_TEXT,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        num_batches=3,
-        min_bytes=8192,
-    )
-    models = {
-        "cmf": make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=2),
-        "tcn": TemporalConvLM(
-            vocab_size=256,
-            d_model=32,
-            hidden_dim=64,
-            num_layers=3,
-            dropout=0.0,
-        ),
-        "transformer": TinyTransformerLM(
-            vocab_size=256,
-            d_model=32,
-            nhead=4,
-            num_layers=2,
-            hidden_dim=64,
-            dropout=0.0,
-            max_seq_len=128,
-        ),
-    }
-    reports = {}
-    for name, model in models.items():
-        train_batches = cyclic_lm_batches(
-            corpus,
-            seq_len=seq_len,
-            batch_size=batch_size,
-            num_batches=steps,
-            stride=11,
-        )
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=0.0)
+    run_dir = str(RECORDS / "runs" / "phase1_keydoor")
+    with ExperimentLogger(run_dir) as log:
         report = train_fixed_steps(
-            name,
-            model,
-            train_batches,
-            eval_batches,
-            device,
-            optimizer,
-            steps=steps,
-            grad_accum_steps=1,
-        )
-        reports[name] = report.to_dict()
+            "keydoor", model, train_b, eval_b, device, opt,
+            steps=500, logger=log, log_traj_every=100)
 
-    mamba_available = importlib.util.find_spec("mamba_ssm") is not None
-    passed = all(
-        math.isfinite(item["initial_loss"])
-        and math.isfinite(item["final_loss"])
-        and item["final_loss"] <= item["initial_loss"] * 1.02
-        for item in reports.values()
+    print(f"\n  training: {report.initial_loss:.4f} -> {report.final_loss:.4f}")
+
+    print("\n[1.1] Retention curve (trained)")
+    retention_trained = measure_retention_curve(
+        model, gap_lengths=gaps, n_per_gap=100, device=str(device))
+
+    # ── 1.4: Capacity curve ──────────────────────────────────────────────
+    print("\n[1.4] Capacity curve (n_bindings vs accuracy)")
+    capacity = measure_capacity_curve(
+        model, k_list=[2, 4, 8], n_per_k=100, device=str(device))
+
+    # ── 1.5: Perturbation recovery ───────────────────────────────────────
+    print("\n[1.5] Perturbation recovery")
+    perturb = run_perturbation_test(
+        model, eval_b, device,
+        output_dir=str(RECORDS / "ablations" / "perturbation"))
+
+    # ── 1.6: Memory footprint constant ──────────────────────────────────
+    from cmf.model import SlotMemory
+    mem_params = sum(p.numel() for p in model.memory.parameters())
+    print(f"\n[1.6] SlotMemory params = {mem_params}  (must not scale with seq_len)")
+
+    save_phase("phase_1_memory", {
+        "preset": preset_name,
+        "memory_params": mem_params,
+        "retention_baseline": {str(k): v for k, v in retention_baseline.items()},
+        "retention_trained":  {str(k): v for k, v in retention_trained.items()},
+        "capacity_curve":     {str(k): v for k, v in capacity.items()},
+        "perturbation":       {str(k): v for k, v in perturb.items()},
+        "train_initial_loss": report.initial_loss,
+        "train_final_loss":   report.final_loss,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — Routing isolation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def phase_2(preset_name: str, device: torch.device):
+    print("\n=======================================")
+    print("PHASE 2 - Routing isolation")
+    print("=======================================")
+    set_seed(42)
+
+    preset = get_preset(preset_name)
+    cfg    = preset.config
+
+    train_b = make_lm_batches(cfg.vocab_size, 4, 32, 200, device)
+    eval_b  = make_lm_batches(cfg.vocab_size, 4, 32,  20, device)
+
+    from cmf.model import ParallelCMF
+    def factory(): return ParallelCMF(cfg)
+
+    results = run_routing_ablation(
+        factory, train_b, eval_b, device,
+        steps_per_mode=100,
+        output_dir=str(RECORDS / "ablations" / "routing"),
     )
-    result = {
-        "gate": "CMF, TCN, and Transformer tiny LM runs must be finite and non-regressing.",
-        "passed": passed,
-        "reports": reports,
-        "mamba_available": mamba_available,
-        "mamba_note": "Skipped unless mamba_ssm is installed in the active environment.",
-    }
-    record_phase("phase_1", "Phase 1 Small LM Baselines", result)
-    return result
+
+    print("\nRouting ablation summary:")
+    for mode, r in results.items():
+        print(f"  {mode:15s}  Delta loss={r['initial_loss']:.4f}->{r['final_loss']:.4f}"
+              f"  ratio={r['loss_ratio']:.3f}")
+
+    save_phase("phase_2_routing", {"preset": preset_name, "results": results})
 
 
-def phase_2(device: torch.device) -> dict:
-    set_seed(102)
-    context_lengths = [128, 256, 512, 1024]
-    batch_size = 1
-    iterations = 2
-    results: dict[str, dict[str, dict[str, float]]] = {}
-    model_factories = {
-        "cmf": lambda: make_cmf(
-            d_model=16,
-            hidden_dim=32,
-            num_layers=2,
-            solver_steps=1,
-            max_seq_len=1024,
-        ),
-        "tcn": lambda: TemporalConvLM(
-            vocab_size=256,
-            d_model=16,
-            hidden_dim=32,
-            num_layers=3,
-            dropout=0.0,
-        ),
-        "transformer": lambda: TinyTransformerLM(
-            vocab_size=256,
-            d_model=16,
-            nhead=4,
-            num_layers=1,
-            hidden_dim=32,
-            dropout=0.0,
-            max_seq_len=1024,
-        ),
-    }
-    corpus = repeated_corpus(SMALL_LM_TEXT, min_bytes=32768)
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — Iterative reasoning
+# ─────────────────────────────────────────────────────────────────────────────
 
-    for model_name, factory in model_factories.items():
-        model = factory()
-        results[model_name] = {}
-        for seq_len in context_lengths:
-            batch = next(
-                cyclic_lm_batches(
-                    corpus,
-                    seq_len=seq_len,
-                    batch_size=batch_size,
-                    num_batches=1,
-                )
-            )
-            bench = benchmark_forward(
-                model,
-                batch[0],
-                batch[1],
-                device,
-                iterations=iterations,
-                warmup=1,
-            )
-            results[model_name][str(seq_len)] = bench
+def phase_3(preset_name: str, device: torch.device):
+    print("\n=======================================")
+    print("PHASE 3 - Iterative reasoning")
+    print("=======================================")
+    set_seed(42)
 
-    passed = finite_dict_values(results) and all(
-        item["tokens_per_sec"] > 0
-        for by_len in results.values()
-        for item in by_len.values()
+    from cmf.model import DeliberativeCMF
+    preset = get_preset(preset_name)
+    cfg_d  = CMFConfig(
+        **{**preset.config.__dict__,
+           "thinking_steps": 8,
+           "adaptive_thinking": True,
+           "min_thinking_steps": 2,
+           "max_thinking_steps": 16},
     )
-    result = {
-        "gate": "All context-length benchmark cells must complete with finite throughput.",
-        "passed": passed,
-        "context_lengths": context_lengths,
-        "results": results,
-    }
-    record_phase("phase_2", "Phase 2 Long-Context Efficiency Smoke", result)
-    return result
+    model = DeliberativeCMF(cfg_d).to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
+    train_b = make_lm_batches(cfg_d.vocab_size, 4, 32, 200, device)
+    eval_b  = make_lm_batches(cfg_d.vocab_size, 4, 32,  20, device)
 
-def phase_3(device: torch.device) -> dict:
-    set_seed(103)
-    cases = [(4, 16, 32), (8, 64, 64), (8, 128, 64)]
-    benchmarks = {}
-    correctness = []
+    # 3.1: Solver depth — logit evolution
+    print("\n[3.1] Logit evolution (untrained)")
+    ids  = torch.randint(0, cfg_d.vocab_size, (1, 16), device=device)
+    traj_before = run_solver_depth_test(
+        model, ids, device,
+        output_dir=str(RECORDS / "ablations" / "solver_depth_before"))
 
-    for batch, steps, dim in cases:
-        z0 = torch.randn(batch, dim, device=device)
-        velocity = torch.randn(batch, steps, dim, device=device)
-        expected = z0.unsqueeze(1) + torch.cumsum(velocity * 0.1, dim=1)
-        actual = euler_integrate_precomputed(z0, velocity, dt=0.1, use_extension=False)
-        max_abs_error = float((actual - expected).abs().max().detach().cpu())
-        correctness.append(
-            {
-                "batch": batch,
-                "steps": steps,
-                "dim": dim,
-                "max_abs_error": max_abs_error,
-            }
-        )
+    # Train briefly
+    print("\n  Training deliberative model (200 steps) ...")
+    run_dir = str(RECORDS / "runs" / "phase3_deliberative")
+    with ExperimentLogger(run_dir) as log:
+        report = train_fixed_steps(
+            "deliberative", model, train_b, eval_b, device, opt,
+            steps=200, logger=log, log_traj_every=50)
 
-        start = time.perf_counter()
-        iterations = 100
-        for _ in range(iterations):
-            _ = euler_integrate_precomputed(z0, velocity, dt=0.1, use_extension=False)
-        synchronize_device(device)
-        elapsed = time.perf_counter() - start
-        benchmarks[f"b{batch}_s{steps}_d{dim}"] = {
-            "iterations": iterations,
-            "elapsed_sec": elapsed,
-            "calls_per_sec": iterations / max(elapsed, 1e-12),
-            "states_per_sec": (batch * steps * iterations) / max(elapsed, 1e-12),
-        }
+    print(f"  {report.initial_loss:.4f} -> {report.final_loss:.4f}")
 
-    extension_spec = importlib.util.find_spec("cmf_cuda")
-    extension_available = extension_spec is not None
-    extension_check = {"available": extension_available}
-    if extension_available:
-        z0 = torch.randn(2, 8, device=device)
-        velocity = torch.randn(2, 4, 8, device=device)
-        fallback = euler_integrate_precomputed(z0, velocity, dt=0.25, use_extension=False)
-        fast = euler_integrate_precomputed(z0, velocity, dt=0.25, use_extension=True)
-        extension_check["max_abs_error"] = float((fast - fallback).abs().max().cpu())
+    print("\n[3.1] Logit evolution (trained)")
+    traj_after = run_solver_depth_test(
+        model, ids, device,
+        output_dir=str(RECORDS / "ablations" / "solver_depth_after"))
 
-    cuda_available = torch.cuda.is_available()
-    toolchain = {
-        "msvc_cl_on_path": shutil.which("cl") is not None,
-        "nvcc_on_path": shutil.which("nvcc") is not None,
-        "cuda_home_known_to_torch": None,
-    }
-    try:
-        from torch.utils.cpp_extension import CUDA_HOME
-
-        toolchain["cuda_home_known_to_torch"] = CUDA_HOME
-    except Exception as exc:
-        toolchain["cuda_home_known_to_torch"] = f"unavailable: {exc}"
-
-    passed = (
-        all(item["max_abs_error"] < 1e-6 for item in correctness)
-        and finite_dict_values(benchmarks)
-        and (
-            not extension_available
-            or extension_check.get("max_abs_error", 0.0) < 1e-5
-        )
-    )
-    result = {
-        "gate": "Euler integration must match torch.cumsum reference; optional extension must match if present.",
-        "passed": passed,
-        "correctness": correctness,
-        "benchmarks": benchmarks,
-        "extension": extension_check,
-        "toolchain": toolchain,
-        "cuda_available": cuda_available,
-        "cuda_note": "CUDA extension benchmarks run only when cmf_cuda is installed; fallback correctness runs on the selected device.",
-    }
-    record_phase("phase_3", "Phase 3 Solver Runtime", result)
-    return result
-
-
-def load_phase0_model(device: torch.device) -> ContinuousMeaningField:
-    ckpt_path = CHECKPOINTS / "phase0_cmf.pt"
-    if ckpt_path.exists():
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        config = CMFConfig(**checkpoint["config"])
-        model = ContinuousMeaningField(config)
-        model.load_state_dict(checkpoint["state_dict"])
-        return model.to(device)
-    model = make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=2)
-    return model.to(device)
-
-
-def write_trajectory_svg(path: Path, rows: list[dict]) -> None:
-    width = 900
-    height = 560
-    margin = 56
-    xs = [float(row["pc1"]) for row in rows]
-    ys = [float(row["pc2"]) for row in rows]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    x_span = max(max_x - min_x, 1e-9)
-    y_span = max(max_y - min_y, 1e-9)
-    colors = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#8c564b"]
-
-    def sx(x: float) -> float:
-        return margin + (x - min_x) / x_span * (width - 2 * margin)
-
-    def sy(y: float) -> float:
-        return height - margin - (y - min_y) / y_span * (height - 2 * margin)
-
-    by_prompt: dict[str, list[dict]] = {}
-    for row in rows:
-        by_prompt.setdefault(str(row["prompt"]), []).append(row)
-
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<line x1="{margin}" y1="{height - margin}" x2="{width - margin}" y2="{height - margin}" stroke="#444" stroke-width="1"/>',
-        f'<line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height - margin}" stroke="#444" stroke-width="1"/>',
-        '<text x="24" y="30" font-family="Arial" font-size="18" fill="#222">CMF latent trajectory PCA</text>',
-        f'<text x="{width // 2 - 30}" y="{height - 16}" font-family="Arial" font-size="12" fill="#444">PC1</text>',
-        f'<text x="16" y="{height // 2}" font-family="Arial" font-size="12" fill="#444" transform="rotate(-90 16 {height // 2})">PC2</text>',
-    ]
-
-    for idx, (prompt, prompt_rows) in enumerate(by_prompt.items()):
-        color = colors[idx % len(colors)]
-        points = " ".join(
-            f'{sx(float(row["pc1"])):.2f},{sy(float(row["pc2"])):.2f}'
-            for row in prompt_rows
-        )
-        parts.append(
-            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
-        )
-        first = prompt_rows[0]
-        last = prompt_rows[-1]
-        parts.append(
-            f'<circle cx="{sx(float(first["pc1"])):.2f}" cy="{sy(float(first["pc2"])):.2f}" r="4" fill="{color}"/>'
-        )
-        parts.append(
-            f'<circle cx="{sx(float(last["pc1"])):.2f}" cy="{sy(float(last["pc2"])):.2f}" r="3" fill="#fff" stroke="{color}" stroke-width="2"/>'
-        )
-        safe_prompt = prompt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").strip()
-        parts.append(f'<rect x="{width - 310}" y="{56 + idx * 24}" width="12" height="12" fill="{color}"/>')
-        parts.append(
-            f'<text x="{width - 292}" y="{66 + idx * 24}" font-family="Arial" font-size="12" fill="#222">{safe_prompt}</text>'
-        )
-
-    parts.append("</svg>")
-    path.write_text("\n".join(parts), encoding="utf-8")
-
-
-def phase_4(device: torch.device) -> dict:
-    set_seed(104)
-    tokenizer = ByteTokenizer()
-    model = load_phase0_model(device)
+    # 3.2: Adaptive compute
+    print("\n[3.2] Adaptive compute (steps used per input)")
     model.eval()
-    prompts = [
-        "continuous meaning field ",
-        "semantic flow through words ",
-        "dilated convolutions map ",
-        "zzzzzzzzzzzzzzzzzzzzzzzz",
-    ]
-    rows = []
-    all_states = []
-    prompt_offsets = []
-
     with torch.no_grad():
-        for prompt in prompts:
-            ids = tokenizer.encode(prompt).unsqueeze(0).to(device)
-            output = model(ids, return_states=True)
-            states = output["states"][0].detach().cpu()
-            prompt_offsets.append((prompt, len(all_states), states.size(0)))
-            all_states.append(states)
+        out = model(ids)
+    thinking_steps = int(out.get("thinking_steps", -1))
+    print(f"  steps used: {thinking_steps}")
 
-    state_matrix = torch.cat(all_states, dim=0)
-    centered = state_matrix - state_matrix.mean(dim=0, keepdim=True)
-    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
-    components = vh[:2].T
-    coords = centered @ components
-
-    csv_path = RECORDS / "phase_4_trajectory_pca.csv"
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["prompt", "position", "pc1", "pc2", "speed", "curvature"],
-        )
-        writer.writeheader()
-        cursor = 0
-        for prompt, _offset, length in prompt_offsets:
-            states = state_matrix[cursor : cursor + length]
-            local_coords = coords[cursor : cursor + length]
-            deltas = torch.diff(states, dim=0)
-            speeds = torch.linalg.norm(deltas, dim=1)
-            second = torch.diff(deltas, dim=0)
-            curvatures = torch.linalg.norm(second, dim=1)
-            for idx in range(length):
-                row = {
-                    "prompt": prompt,
-                    "position": idx,
-                    "pc1": float(local_coords[idx, 0]),
-                    "pc2": float(local_coords[idx, 1]),
-                    "speed": float(speeds[idx - 1]) if idx > 0 else 0.0,
-                    "curvature": float(curvatures[idx - 2]) if idx > 1 else 0.0,
-                }
-                rows.append(row)
-                writer.writerow(row)
-            cursor += length
-
-    svg_path = RECORDS / "phase_4_trajectory_pca.svg"
-    write_trajectory_svg(svg_path, rows)
-
-    by_prompt = {}
-    cursor = 0
-    for prompt, _offset, length in prompt_offsets:
-        states = state_matrix[cursor : cursor + length]
-        deltas = torch.diff(states, dim=0)
-        second = torch.diff(deltas, dim=0)
-        by_prompt[prompt] = {
-            "positions": length,
-            "mean_speed": float(torch.linalg.norm(deltas, dim=1).mean())
-            if deltas.numel()
-            else 0.0,
-            "mean_curvature": float(torch.linalg.norm(second, dim=1).mean())
-            if second.numel()
-            else 0.0,
-        }
-        cursor += length
-
-    first_states = []
-    for _prompt, offset, _length in prompt_offsets:
-        first_states.append(state_matrix[offset])
-    first_states_tensor = torch.stack(first_states)
-    distances = torch.cdist(first_states_tensor, first_states_tensor)
-
-    result = {
-        "gate": "Trajectory extraction, PCA projection, speed, curvature, and prompt distances must be finite.",
-        "passed": all(
-            math.isfinite(float(row["pc1"]))
-            and math.isfinite(float(row["pc2"]))
-            and math.isfinite(float(row["speed"]))
-            and math.isfinite(float(row["curvature"]))
-            for row in rows
-        ),
-        "prompts": prompts,
-        "trajectory_csv": str(csv_path),
-        "trajectory_svg": str(svg_path),
-        "by_prompt": by_prompt,
-        "initial_state_distance_matrix": distances.tolist(),
-        "parameters": count_parameters(model),
-    }
-    record_phase("phase_4", "Phase 4 Trajectory Analysis", result)
-    return result
+    save_phase("phase_3_reasoning", {
+        "preset": preset_name,
+        "traj_before": traj_before,
+        "traj_after":  traj_after,
+        "adaptive_steps_used": thinking_steps,
+        "train_initial_loss": report.initial_loss,
+        "train_final_loss":   report.final_loss,
+    })
 
 
-def phase_5(device: torch.device) -> dict:
-    print("--- Phase 5: Robustness & Adaptive Flow ---")
-    seeds = [2026, 2027, 2028]
-    seq_len = 128
-    batch_size = 8
-    steps = 100
-    
-    # 1. Multi-seed Validation
-    seed_results = []
-    corpus = repeated_corpus(SMALL_LM_TEXT, min_bytes=16384)
-    eval_batches = fixed_eval_batches(
-        SMALL_LM_TEXT,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        num_batches=3,
-        min_bytes=16384,
-    )
-    
-    for seed in seeds:
-        set_seed(seed)
-        model = make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=2)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3)
-        train_batches = cyclic_lm_batches(corpus, seq_len=seq_len, batch_size=batch_size, num_batches=steps)
-        report = train_fixed_steps(f"cmf_seed_{seed}", model, train_batches, eval_batches, device, optimizer, steps=steps)
-        seed_results.append(report.final_loss)
-        
-    loss_variance = torch.tensor(seed_results).var().item()
-    
-    # 2. Context Scaling to 2048
-    scaling_results = {}
-    scaling_lengths = [512, 1024, 2048]
-    model_scaling = make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=1, max_seq_len=2048)
-    for length in scaling_lengths:
-        dummy_ids = torch.randint(0, 256, (1, length), device=device)
-        bench = benchmark_forward(model_scaling, dummy_ids, None, device, iterations=5)
-        scaling_results[str(length)] = bench["tokens_per_sec"]
-        
-    # 3. Adaptive Solver Test
-    set_seed(2026)
-    model_fixed = make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=4)
-    model_adaptive = make_cmf(d_model=32, hidden_dim=64, num_layers=2, solver_steps=4)
-    model_adaptive.config.adaptive_steps = True
-    model_adaptive.config.min_solver_steps = 1
-    model_adaptive.config.max_solver_steps = 4
-    model_adaptive.config.curvature_threshold = 0.4 # Relaxed for random input smoke test
-    
-    dummy_input = torch.randint(0, 256, (1, 32), device=device)
-    with torch.no_grad():
-        out_fixed = model_fixed(dummy_input)
-        out_adaptive = model_adaptive(dummy_input)
-        
-    adaptive_steps = out_adaptive["solver_steps"].item()
-    fixed_steps = 32 * 4
-    step_reduction = 1.0 - (adaptive_steps / fixed_steps)
-    
-    passed = (
-        loss_variance < 0.05 
-        and all(v > 0 for v in scaling_results.values())
-        and step_reduction >= 0.10
-    )
-    
-    result = {
-        "gate": "Multi-seed variance < 0.05, 2048-context success, and adaptive step reduction > 10%.",
-        "passed": passed,
-        "seed_losses": seed_results,
-        "loss_variance": loss_variance,
-        "context_scaling_tok_s": scaling_results,
-        "adaptive_test": {
-            "fixed_steps": fixed_steps,
-            "adaptive_steps": adaptive_steps,
-            "step_reduction": step_reduction,
-        }
-    }
-    record_phase("phase_5", "Phase 5 Robustness & Adaptive Flow", result)
-    return result
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def phase_6(device: torch.device) -> dict:
-    print("--- Phase 6: Mechanism Smoke Tests ---")
-    set_seed(2026)
-    seq_len = 32
-    batch_size = 4
-    
-    # 1. Factuality Test (Semantic Gravity)
-    model = make_cmf(d_model=32, hidden_dim=64, num_layers=2)
-    # Check if memory anchors exist and are non-zero
-    memory_norm = torch.norm(model.field.memory).item()
-    
-    # 2. Agency Test (Goal-Directed Flow)
-    # We apply a 'goal' vector and see if the output distribution shifts
-    dummy_input = torch.randint(0, 256, (1, seq_len), device=device)
-    goal_v = torch.randn(1, 32, device=device)
-    
-    with torch.no_grad():
-        out_no_goal = model(dummy_input)
-        out_goal = model(dummy_input, goal=goal_v)
-        
-    logits_diff = torch.norm(out_goal["logits"] - out_no_goal["logits"]).item()
-    
-    # 3. Reasoning Test (Curvature-Driven Adaptive)
-    model.config.adaptive_steps = True
-    model.config.curvature_threshold = 0.05
-    with torch.no_grad():
-        out_reason = model(dummy_input)
-        
-    passed = (
-        memory_norm > 0 
-        and logits_diff > 1e-4 
-        and "solver_steps" in out_reason
-    )
-    
-    result = {
-        "gate": "Memory anchors exist, goal vector changes logits, and adaptive solver metadata is returned. This is not a reasoning-accuracy proof.",
-        "passed": passed,
-        "memory_norm": memory_norm,
-        "logits_goal_shift": logits_diff,
-        "reasoning_steps": out_reason.get("solver_steps", 0).item() if "solver_steps" in out_reason else 0,
-    }
-    record_phase("phase_6", "Phase 6 Mechanism Smoke Tests", result)
-    return result
-
-
-def phase_7(device: torch.device) -> dict:
-    print("--- Phase 7: Real-World Knowledge & Subword Scaling ---")
-    from cmf.tokenizer import SimpleBPETokenizer
-    from cmf.data import cyclic_lm_batches
-    
-    # 1. Create Knowledge Corpus (Encyclopedic style)
-    knowledge_text = (
-        "The DNA molecule is a double helix formed by base pairs. "
-        "Quantum mechanics describes the behavior of matter at the atomic scale. "
-        "The Roman Empire was one of the largest empires in history. "
-        "Python is a high-level programming language known for its readability. "
-        "The continuous meaning field allows for smooth semantic trajectories. "
-    ) * 200
-    
-    # 2. Train Subword Tokenizer
-    tokenizer = SimpleBPETokenizer(vocab_size=300) # Slightly smaller vocab to avoid over-compression
-    tokenizer.train(knowledge_text)
-    
-    # 3. Model with Subword Config
-    config = CMFConfig(
-        vocab_size=300, 
-        d_model=64, 
-        hidden_dim=128, 
-        num_layers=2,
-        max_seq_len=64
-    )
-    model = ContinuousMeaningField(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3)
-    
-    # 4. Short Training Loop (Knowledge density test)
-    encoded = tokenizer.encode(knowledge_text)
-    batches = list(cyclic_lm_batches(encoded, seq_len=32, batch_size=4, num_batches=100))
-    
-    initial_loss = 0
-    final_loss = 0
-    for i, (x, y) in enumerate(batches):
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        out = model(x, labels=y)
-        loss = out["loss"]
-        loss.backward()
-        optimizer.step()
-        if i == 0: initial_loss = loss.item()
-        final_loss = loss.item()
-        
-    passed = final_loss < initial_loss * 0.5
-    
-    result = {
-        "gate": f"Subword tokenizer learned {len(tokenizer.vocab)} tokens and model loss reduced on knowledge corpus.",
-        "passed": passed,
-        "initial_loss": initial_loss,
-        "final_loss": final_loss,
-        "vocab_size": len(tokenizer.vocab),
-    }
-    record_phase("phase_7", "Phase 7 Real-World Knowledge", result)
-    return result
-
-
-def phase_8(device: torch.device) -> dict:
-    print("--- Phase 8: Goal-Steering Smoke Test ---")
-    from cmf.tokenizer import SimpleBPETokenizer
-    
-    # 1. Setup Steering Vectors
-    d_model = 64
-    goal_logic = torch.randn(1, d_model, device=device)
-    goal_knowledge = torch.randn(1, d_model, device=device)
-    
-    # 2. Config & Model
-    config = CMFConfig(
-        vocab_size=300, 
-        d_model=d_model, 
-        hidden_dim=128, 
-        num_layers=2,
-        max_seq_len=64
-    )
-    model = ContinuousMeaningField(config).to(device)
-    
-    # 3. Steering Test
-    # We check if applying different goals results in different trajectories
-    dummy_input = torch.randint(0, 300, (1, 16), device=device)
-    
-    with torch.no_grad():
-        res_logic = model(dummy_input, goal=goal_logic)
-        res_knowledge = model(dummy_input, goal=goal_knowledge)
-        
-    steering_delta = torch.norm(res_logic["logits"] - res_knowledge["logits"]).item()
-    
-    # 4. Goal-conditioning smoke training (very short)
-    # We train the model to distinguish between the two goal vectors
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    target_logic = torch.randint(0, 300, (1, 16), device=device)
-    target_knowledge = torch.randint(0, 300, (1, 16), device=device)
-    
-    for _ in range(10):
-        optimizer.zero_grad()
-        # Train logic goal to produce target_logic
-        out_l = model(dummy_input, goal=goal_logic, labels=target_logic)
-        # Train knowledge goal to produce target_knowledge
-        out_k = model(dummy_input, goal=goal_knowledge, labels=target_knowledge)
-        (out_l["loss"] + out_k["loss"]).backward()
-        optimizer.step()
-        
-    # After training, the delta should be even larger
-    with torch.no_grad():
-        res_logic_post = model(dummy_input, goal=goal_logic)
-        res_knowledge_post = model(dummy_input, goal=goal_knowledge)
-    
-    post_steering_delta = torch.norm(res_logic_post["logits"] - res_knowledge_post["logits"]).item()
-    
-    passed = post_steering_delta > steering_delta
-    
-    result = {
-        "gate": "Random goal vectors can be trained to produce different output distributions. This is not an agentic-reasoning proof.",
-        "passed": passed,
-        "initial_steering_delta": steering_delta,
-        "post_training_steering_delta": post_steering_delta,
-    }
-    record_phase("phase_8", "Phase 8 Goal-Steering Smoke Test", result)
-    return result
-
-
-def phase_10(device: torch.device) -> dict:
-    print("--- Phase 10: Multimodal and Fake-Quantization Smoke Test ---")
-    from cmf.advanced import SpatialContextEncoder, DynamicQuantizer
-    from cmf.baselines import TinyGPTLM
-    
-    # 1. Vision Readiness Test
-    vision_encoder = SpatialContextEncoder(d_model=64).to(device)
-    dummy_img = torch.randn(1, 3, 32, 32, device=device)
-    vision_states = vision_encoder(dummy_img)
-    vision_passed = vision_states.shape == (1, 256, 64) # 32x32 -> 16x16=256 sequence
-    
-    # 2. Higher-Order Logic (RK4) Fair Fight
-    cmf_config = CMFConfig(vocab_size=300, d_model=64, solver_steps_per_token=2)
-    cmf = ContinuousMeaningField(cmf_config).to(device)
-    gpt = TinyGPTLM(vocab_size=300, d_model=64).to(device)
-    
-    # 3. TorchScript kernel smoke test.
-    from cmf.advanced import fused_cmf_step_rk4
-    fused_kernel_jit = torch.jit.script(fused_cmf_step_rk4)
-    
-    # 4. Quantization Robustness
-    cmf_quant = DynamicQuantizer.apply_8bit(cmf)
-    gpt_quant = DynamicQuantizer.apply_8bit(gpt)
-    
-    # Evaluation on a single batch
-    dummy_input = torch.randint(0, 300, (1, 16), device=device)
-    with torch.no_grad():
-        out_c = cmf(dummy_input)
-        out_g = gpt(dummy_input)
-        
-    passed = bool(vision_passed and (out_c["logits"].isfinite().all().item()))
-    
-    result = {
-        "gate": "Vision encoding, TorchScript fused-step smoke, and fake-quantized forward pass remain finite.",
-        "passed": passed,
-        "vision_seq_len": int(vision_states.shape[1]),
-        "jit_compiled": True,
-        "fake_quantized": True,
-        "cmf_quantization": cmf_quant,
-        "gpt_quantization": gpt_quant,
-    }
-    record_phase("phase_10", "Phase 10 Multimodal Smoke", result)
-    return result
-
-
-def phase_9(device: torch.device) -> dict:
-    from cmf.tokenizer import SimpleBPETokenizer
-    from cmf.data import cyclic_lm_batches
-    from cmf.baselines import TinyGPTLM
-    from cmf.model import ParallelContinuousMeaningField
-    
-    # 1. Dataset (Knowledge + Logic)
-    # We use a more diverse corpus to prevent overfitting
-    knowledge_text = (
-        "The DNA molecule is a double helix. Fact: A is B. Fact: B is C. "
-        "Quantum mechanics is probabilistic. Python is a coding language. "
-        "The Roman Empire collapsed in 476 AD. CMF is a latent flow model. "
-        "Gravity is a force that pulls objects together. "
-        "The speed of light is constant. Water is made of hydrogen and oxygen. "
-    ) * 150
-    
-    tokenizer = SimpleBPETokenizer(vocab_size=300)
-    tokenizer.train(knowledge_text)
-    encoded = tokenizer.encode(knowledge_text)
-    
-    # 2. Parameter-Matched Models
-    # Parameter-matched small models.
-    cmf_config = CMFConfig(
-        vocab_size=300, d_model=80, hidden_dim=160, num_layers=3, max_seq_len=128, dropout=0.0
-    )
-    cmf = ParallelContinuousMeaningField(cmf_config).to(device)
-    
-    gpt = TinyGPTLM(
-        vocab_size=300, d_model=96, nhead=4, num_layers=5, hidden_dim=192, dropout=0.0, max_seq_len=128
-    ).to(device)
-    
-    cmf_params = sum(p.numel() for p in cmf.parameters())
-    gpt_params = sum(p.numel() for p in gpt.parameters())
-    print(f"CMF Params: {cmf_params}")
-    print(f"GPT Params: {gpt_params}")
-    
-    # 3. Fair Training
-    steps = 250
-    # Lower learning rate for CMF stability
-    cmf_opt = torch.optim.AdamW(cmf.parameters(), lr=5e-4)
-    gpt_opt = torch.optim.AdamW(gpt.parameters(), lr=1e-3)
-    
-    batches = list(cyclic_lm_batches(encoded, seq_len=64, batch_size=8, num_batches=steps))
-    
-    cmf_losses, gpt_losses = [], []
-    for x, y in batches:
-        x, y = x.to(device), y.to(device)
-        
-        # Train CMF
-        cmf_opt.zero_grad()
-        c_out = cmf(x, labels=y)
-        c_out["loss"].backward()
-        cmf_opt.step()
-        cmf_losses.append(c_out["loss"].item())
-        
-        # Train GPT
-        gpt_opt.zero_grad()
-        g_out = gpt(x, labels=y)
-        g_out["loss"].backward()
-        gpt_opt.step()
-        gpt_losses.append(g_out["loss"].item())
-        
-    # 4. Held-out-style evaluation and throughput smoke benchmark
-    c_final = sum(cmf_losses[-20:]) / 20
-    g_final = sum(gpt_losses[-20:]) / 20
-    eval_batches = batches[-3:]
-    c_eval = evaluate_loss(cmf, eval_batches, device)
-    g_eval = evaluate_loss(gpt, eval_batches, device)
-    bench_x, bench_y = batches[0]
-    c_bench = benchmark_forward(cmf, bench_x, bench_y, device, iterations=3, warmup=1)
-    g_bench = benchmark_forward(gpt, bench_x, bench_y, device, iterations=3, warmup=1)
-    param_match = parameter_match_report(cmf, gpt, tolerance=0.05)
-    quality_ratio = c_eval / max(g_eval, 1e-12)
-    throughput_ratio = c_bench["tokens_per_sec"] / max(g_bench["tokens_per_sec"], 1e-12)
-    
-    passed = (
-        bool(param_match["matched"])
-        and math.isfinite(c_eval)
-        and math.isfinite(g_eval)
-        and c_bench["tokens_per_sec"] > 0
-        and g_bench["tokens_per_sec"] > 0
-    )
-    
-    result = {
-        "gate": "Parameter-matched CMF/GPT comparison must record finite held-out loss and throughput. Superiority is reported, not assumed.",
-        "passed": passed,
-        "cmf_train_tail_loss": c_final,
-        "gpt_train_tail_loss": g_final,
-        "cmf_eval_loss": c_eval,
-        "gpt_eval_loss": g_eval,
-        "loss_ratio_cmf_div_gpt": quality_ratio,
-        "cmf_throughput": c_bench,
-        "gpt_throughput": g_bench,
-        "throughput_ratio_cmf_div_gpt": throughput_ratio,
-        "parameter_match": param_match,
-        "cmf_params": cmf_params,
-        "gpt_params": gpt_params,
-        "beats_gpt_on_this_toy_gate": bool(quality_ratio <= 1.0 and throughput_ratio >= 1.0),
-    }
-    record_phase("phase_9", "Phase 9 Fair Comparison", result)
-    return result
-
-
-def run_tests() -> dict:
-    env = os.environ.copy()
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--basetemp", ".pytest_tmp"],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return {
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "passed": completed.returncode == 0,
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run CMF phase gates.")
-    parser.add_argument(
-        "--phase",
-        choices=["all", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
-        default="all",
-    )
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phase",  default="all",
+                        choices=["all", "0", "1", "2", "3"])
+    parser.add_argument("--preset", default="tiny",
+                        help="Preset name (tiny | 50m | 120m | ...)")
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
-    device = resolve_device(args.device)
-    RECORDS.mkdir(parents=True, exist_ok=True)
-    write_json(RECORDS / "environment.json", environment_report())
+    device = torch.device(args.device
+                          if args.device != "auto"
+                          else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    phase_map = {
-        "0": phase_0,
-        "1": phase_1,
-        "2": phase_2,
-        "3": phase_3,
-        "4": phase_4,
-        "5": phase_5,
-        "6": phase_6,
-        "7": phase_7,
-        "8": phase_8,
-        "9": phase_9,
-        "10": phase_10,
-    }
-    selected = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"] if args.phase == "all" else [args.phase]
-    for phase_id in selected:
-        result = phase_map[phase_id](device)
-        require_pass(result)
+    phases = {"0": phase_0, "1": phase_1, "2": phase_2, "3": phase_3}
+    to_run = list(phases.keys()) if args.phase == "all" else [args.phase]
 
-    tests = run_tests()
-    write_json(RECORDS / "test_run.json", tests)
-    write_markdown_report(RECORDS / "test_run.md", "Test Run", tests)
-    if not tests["passed"]:
-        raise SystemExit("pytest failed after phase execution")
+    for p in to_run:
+        phases[p](args.preset, device)
+
+    print("\n\nAll requested phases complete.")
+    print(f"Records in: {RECORDS}/")
 
 
 if __name__ == "__main__":

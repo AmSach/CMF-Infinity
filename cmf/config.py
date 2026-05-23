@@ -1,46 +1,62 @@
-from dataclasses import dataclass
+from __future__ import annotations
+from dataclasses import dataclass, field
 
 
 @dataclass
 class CMFConfig:
-    vocab_size: int = 256
-    d_model: int = 128
-    hidden_dim: int = 256
-    num_layers: int = 6
-    kernel_size: int = 3
-    dropout: float = 0.1
-    solver_steps_per_token: int = 4
-    solver_method: str = "symplectic"
-    max_seq_len: int = 256
-    causal: bool = True
+    # ── Vocabulary / embedding ──────────────────────────────────────────
+    vocab_size: int = 50257
+    d_model: int = 512
     tie_embeddings: bool = True
-    # Adaptive Flow settings
-    adaptive_steps: bool = True  # enable adaptive solver steps by default to avoid loops
-    min_solver_steps: int = 1
-    max_solver_steps: int = 8  # allow more solver steps when needed
+
+    # ── Dilated CNN encoder ─────────────────────────────────────────────
+    num_layers: int = 6
+    hidden_dim: int = 2048        # conv channel width (gated, so *2 inside)
+    kernel_size: int = 3
+    causal: bool = True
+    dropout: float = 0.1
+
+    # ── Slot memory ─────────────────────────────────────────────────────
+    # Fixed capacity — O(num_slots), NOT O(seq_len)
+    num_slots: int = 64
+
+    # ── Solver ─────────────────────────────────────────────────────────
+    solver_steps: int = 8          # default fixed steps
+    solver_method: str = "euler"   # "euler" | "rk4"
+    adaptive_solver: bool = False
+    min_solver_steps: int = 2
+    max_solver_steps: int = 16
     curvature_threshold: float = 0.05
-    # Deliberative latent refinement settings
-    thinking_steps: int = 2
-    adaptive_thinking: bool = True  # enable adaptive thinking by default
-    min_thinking_steps: int = 1
-    max_thinking_steps: int = 8  # higher ceiling for adaptive thinking
-    halting_threshold: float = 0.90  # more conservative to stop early and avoid runaway loops
-    # CMF-v2 upgrades
-    use_global_memory_router: bool = False
-    # AGI-scale architecture settings
-    num_memory_anchors: int = 64     # scales factual capacity; 64 for 120M, 256 for 7B, 1024 for 70B+
-    field_depth: int = 2             # number of hidden layers in the VectorField MLP; 2 for 120M, 4 for 7B+
+
+    # ── Deliberation (thinking steps) ──────────────────────────────────
+    thinking_steps: int = 8
+    adaptive_thinking: bool = False
+    min_thinking_steps: int = 2
+    max_thinking_steps: int = 16
+    halting_threshold: float = 0.5
+
+    # ── Routing mode (ablation axis) ────────────────────────────────────
+    # "full" | "sparse_topk" | "local_window" | "none"
+    routing_mode: str = "sparse_topk"
+    routing_topk: int = 16
+    routing_window: int = 64
+
+    # ── Misc ─────────────────────────────────────────────────────────────
+    max_seq_len: int = 2048
 
 
 @dataclass
 class TrainingConfig:
-    micro_batch_size: int = 8
-    gradient_accumulation_steps: int = 32
+    micro_batch_size: int = 4
+    gradient_accumulation_steps: int = 8
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
-    max_steps: int = 1000
+    max_steps: int = 10_000
+    warmup_steps: int = 500
     clip_grad_norm: float = 1.0
-    log_every: int = 25
+    log_every: int = 50
+    eval_every: int = 500
+    use_amp: bool = False
 
     @property
     def effective_batch_size(self) -> int:
