@@ -349,7 +349,7 @@ def run_solver_depth_test(
 
     path = Path(output_dir) / "solver_depth.json"
     path.write_text(json.dumps(traj, indent=2))
-    print(f"\nSolver depth test → {path}")
+    print(f"\nSolver depth test -> {path}")
     for t in traj:
         print(f"  step={t['step']:2d}  entropy={t['logit_entropy']:.4f}"
               f"  z_norm={t['z_norm']:.4f}  v_norm={t['v_norm']:.4f}")

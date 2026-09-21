@@ -156,17 +156,15 @@ class ContextEncoder(nn.Module):
 
 class SlotMemory(nn.Module):
     """
-    Fixed-capacity associative memory.
+    Fixed-capacity associative memory featuring a neuromorphic Hippocampal Slot Gating mechanism.
 
-    Read:  soft attention over num_slots key vectors → retrieved value
-    Write: gated update of slot values from current input (training only)
+    Read:  soft attention over key signatures -> dynamic batch slot values retrieval.
+    Write: fully differentiable, Winner-Take-All (WTA) competitive sequence updates
+           with overwrite protection and persistence decay.
 
-    Memory footprint = num_slots × d_model × 2 (keys + values).
-    This is CONSTANT regardless of sequence length.
-
-    Replaces FactualMemoryBank which was a static weight matrix that:
-    - did not update from the input stream at all
-    - was identical to a learned bias in the VectorField MLP
+    Unlike standard mean-pooled updates, this writes sequentially across tokens
+    to allow complete backpropagation of autograd gradients from subsequent reads
+    directly through the write gates and write projections.
     """
     def __init__(self, cfg: CMFConfig) -> None:
         super().__init__()
@@ -181,41 +179,76 @@ class SlotMemory(nn.Module):
         self.n_slots = S
         self.d = D
 
-    def read(self, z: Tensor) -> Tensor:
-        """z: (B, T, D) or (B, D) → retrieved: same shape"""
-        squeeze = z.ndim == 2
-        if squeeze:
-            z = z.unsqueeze(1)
+    def read_dynamic(self, z: Tensor, slot_vals_t: Tensor) -> Tensor:
+        """z: (B, T, D), slot_vals_t: (B, S, D) -> retrieved: (B, T, D)"""
         B, T, D = z.shape
         q = self.q_proj(z)                                     # (B, T, D)
         k = self.slot_keys                                      # (S, D)
-        v = self.slot_vals                                      # (S, D)
         scores = torch.matmul(q, k.T) / math.sqrt(D)           # (B, T, S)
         attn   = F.softmax(scores, dim=-1)                      # (B, T, S)
-        out    = torch.matmul(attn, v)                          # (B, T, D)
+        out    = torch.bmm(attn, slot_vals_t)                  # (B, T, D)
         out    = self.out_proj(out)
-        if squeeze:
-            out = out.squeeze(1)
         return out
 
-    def write(self, z: Tensor, new_info: Tensor) -> None:
-        """Only runs during training. z, new_info: (B, T, D) or (B, D)."""
-        if not self.training:
-            return
-        if z.ndim == 3:
-            z = z.mean(dim=1)
-            new_info = new_info.mean(dim=1)
-        gate  = torch.sigmoid(self.write_gate(torch.cat([z, new_info], dim=-1)))  # (B, S)
-        val   = self.write_proj(new_info)                                          # (B, D)
-        delta = gate.unsqueeze(-1) * val.unsqueeze(1)                              # (B, S, D)
-        self.slot_vals.data.add_(0.005 * delta.detach().mean(dim=0))
+    def write(self, z: Tensor, new_info: Tensor) -> Tensor:
+        """
+        Differentiable, sequential competitive gating slot write.
+        Processes the sequence token-by-token to allow full autograd backpropagation.
+        z, new_info: (B, T, D)
+        Returns: updated slot values of shape (B, S, D)
+        """
+        B, T, D = z.shape
+        S = self.n_slots
+        
+        # Initialize batch slot values from parameter
+        slot_vals_t = self.slot_vals.unsqueeze(0).repeat(B, 1, 1)
+        
+        # Process sequentially to build the recurrent computational graph
+        for t in range(T):
+            zt = z[:, t]  # (B, D)
+            infot = new_info[:, t]  # (B, D)
+            
+            # Cosine similarity between query and slot keys for WTA routing
+            q = self.q_proj(zt)  # (B, D)
+            scores = torch.matmul(q, self.slot_keys.T) / math.sqrt(D)  # (B, S)
+            
+            # Competitive Top-K Winner-Take-All selection
+            k_wta = min(4, S)
+            _, topk_indices = torch.topk(scores, k=k_wta, dim=-1)
+            
+            # Write gate calculation
+            gate_logits = self.write_gate(torch.cat([zt, infot], dim=-1))  # (B, S)
+            
+            # Soft-WTA allocation (mask out non-topk slots)
+            mask = torch.full_like(gate_logits, -1e9)
+            mask.scatter_(dim=-1, index=topk_indices, src=gate_logits.gather(dim=-1, index=topk_indices))
+            gate = torch.softmax(mask, dim=-1)  # (B, S)
+            
+            # Write projection
+            val = self.write_proj(infot)  # (B, D)
+            
+            # Gated update with overwrite decay
+            decay = gate.unsqueeze(-1)  # (B, S, 1)
+            update = val.unsqueeze(1)  # (B, 1, D)
+            
+            slot_vals_t = (1.0 - 0.05 * decay) * slot_vals_t + 0.05 * decay * update
+            
+        return slot_vals_t
 
     def forward(self, z: Tensor, context: Tensor) -> Tensor:
-        retrieved = self.read(z)
-        self.write(z, context)
-        if z.ndim == retrieved.ndim:
-            return self.norm(z + retrieved)
-        return retrieved
+        squeeze = z.ndim == 2
+        if squeeze:
+            z = z.unsqueeze(1)
+            context = context.unsqueeze(1)
+            
+        slot_vals_t = self.write(z, context)
+        retrieved = self.read_dynamic(z, slot_vals_t)
+        
+        if squeeze:
+            z = z.squeeze(1)
+            retrieved = retrieved.squeeze(1)
+            
+        return self.norm(z + retrieved)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,7 +308,7 @@ class ManifoldAnchor(nn.Module):
         return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
     def forward(self, z: Tensor, context: Tensor) -> Tensor:
-        """z: (B,T,D), context: (B,T,D) → update: (B,T,D)"""
+        """z: (B,T,D), context: (B,T,D) -> update: (B,T,D)"""
         if self.mode == "none":
             return torch.zeros_like(z)
 
@@ -297,10 +330,60 @@ class ManifoldAnchor(nn.Module):
             outside = (row - col) > self.window
             scores = scores.masked_fill(outside[None, None], float("-inf"))
 
-        if self.mode == "sparse_topk":
+        elif self.mode == "sparse_topk":
             k = min(self.topk, T)
             topk_vals, _ = scores.topk(k, dim=-1)
             scores = scores.masked_fill(scores < topk_vals[..., -1:], float("-inf"))
+
+        elif self.mode == "ann":
+            C = 8  # Coarse block size
+            pad_len = (C - T % C) % C
+            if pad_len > 0:
+                scores_padded = F.pad(scores, (0, pad_len), value=float("-inf"))
+            else:
+                scores_padded = scores
+            
+            T_pad = scores_padded.size(-1)
+            scores_blocked = scores_padded.view(B, self.n_heads, T, T_pad // C, C)
+            scores_blocked_clean = scores_blocked.clamp(min=-1e9)
+            block_max, _ = scores_blocked_clean.max(dim=-1)
+            
+            M = max(1, (T_pad // C) // 4)  # Search top 25% of blocks
+            top_blocks_vals, _ = block_max.topk(M, dim=-1)
+            threshold = top_blocks_vals[..., -1:]
+            
+            block_mask = block_max >= threshold
+            token_mask = block_mask.unsqueeze(-1).expand(-1, -1, -1, -1, C).reshape(B, self.n_heads, T, T_pad)[..., :T]
+            
+            # Local window safety
+            row_idx = torch.arange(T, device=z.device).unsqueeze(1)
+            col_idx = torch.arange(T, device=z.device).unsqueeze(0)
+            is_local = (row_idx - col_idx >= 0) & (row_idx - col_idx <= 16)
+            
+            final_mask = token_mask | is_local[None, None]
+            scores = scores.masked_fill(~final_mask, float("-inf"))
+
+        elif self.mode == "hierarchical":
+            L = 32  # Local episodic window
+            C = 8   # Semantic chunk block size
+            row_idx = torch.arange(T, device=z.device).unsqueeze(1)
+            col_idx = torch.arange(T, device=z.device).unsqueeze(0)
+            is_local = (row_idx - col_idx >= 0) & (row_idx - col_idx <= L)
+            
+            pad_len = (C - T % C) % C
+            if pad_len > 0:
+                scores_padded = F.pad(scores, (0, pad_len), value=float("-inf"))
+            else:
+                scores_padded = scores
+            
+            T_pad = scores_padded.size(-1)
+            scores_blocked = scores_padded.view(B, self.n_heads, T, T_pad // C, C)
+            scores_blocked_clean = scores_blocked.clamp(min=-1e9)
+            block_means = scores_blocked_clean.mean(dim=-1, keepdim=True)
+            
+            scores_hier = block_means.expand_as(scores_blocked).reshape(B, self.n_heads, T, T_pad)[..., :T]
+            scores = torch.where(is_local[None, None], scores, scores_hier)
+            scores = scores.masked_fill(causal[None, None], float("-inf"))
 
         attn = self.drop(F.softmax(scores, dim=-1))
         out  = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T, self.d)
