@@ -1,3 +1,14 @@
+# 🌌 CONTINUOUS MEANING FIELD (CMF-INFINITY): BEYOND NEXT-TOKEN PREDICTION
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Framework: PyTorch + C++/CUDA](https://img.shields.io/badge/Engine-PyTorch%20%7C%20CUDA%20Kernels-blue.svg)]()
+[![Formulation: Neural ODE](https://img.shields.io/badge/Math-Continuous%20Vector%20Field%20%7C%20dz%2Fdt-red.svg)]()
+[![Scaling: Linear Compute](https://img.shields.io/badge/Compute-Adaptive%20ODE%20Trajectory-brightgreen.svg)]()
+
+> *"Transformers treat human language as a discrete sequence of dice rolls over a dictionary. CMF models language as continuous geodesic trajectories through a high-dimensional semantic manifold."*
+
+---
+
 # Continuous Meaning Field / CMF Infinity
 
 Continuous Meaning Field (CMF) is a research prototype for modeling language as a continuous trajectory through a learned semantic vector field.
